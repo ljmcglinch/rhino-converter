@@ -1,0 +1,96 @@
+Verification environment: Linux, Python 3.12.14
+Engine versions: cadquery-ocp 7.8.1.1.post1, rhino3dm 8.35.0, NumPy 2.3.5
+
+Automated checks cover:
+- all six output formats on an inch-based solid;
+- STEP re-import, length dimensions and solid volume;
+- a sphere STEP round-trip and analytic volume;
+- a circular trimmed planar face: area agreement within 0.01%, measured
+  approximately 0.004% error (trim boundaries may be approximated);
+- a positioned block, excluding its definition at the origin;
+- rejecting exact CAD export for mesh sources while writing OBJ;
+- hidden geometry and construction-curve exclusions;
+- rejecting unitless sources;
+- unique export folders and unchanged source hashes;
+- worker success and readable failure reports.
+
+Additional native Rhino sample checks passed: Cone.3dm, Surface.3dm,
+PolysurfCylinder.3dm from KeithSloan/ImportExport_3DM testCases, exported
+to STEP, IGES and STL. These samples are not bundled in this download.
+
+Not verified: Windows runtime, Explorer drag event delivery, PyInstaller build,
+large production lighting assemblies, exotic trims, CAD plug-in geometry,
+and interoperability in the office's receiving CAD applications.
+
+Previous UI update suite: 15 tests passed (11 conversion, 4 desktop).
+Additional regressions: automatic annotation/curve exclusion, conversion from
+a temporary copy, source hash preservation after Convert anyway, and explicit
+skipped-object reporting on partial exports.
+Desktop checks cover two-column layout at 1200x860 and small-window layout
+at 960x820, 640x480, 480x420 and
+460x360, form scrolling, visible action controls, event-loop heartbeats while
+the worker converts, and pausing/resuming through Convert anyway. File-list
+checks cover multiple paths, .3DM extension casing, spaces, deduplication,
+missing files and non-model file rejection. Custom name and per-model folder
+tests cover duplicate names and preservation of previous outputs. All six
+export filenames are checked for the uppercase format suffix, such as _STEP.
+Startup checks verify that the unfinished main window stays hidden behind
+the loading screen, initial text wraps use a usable width, and the splash
+closes when the main window is ready. Modern card layout uses the same
+small-window and responsiveness checks. Windows appearance remains unverified.
+
+Progress-file access fix:
+15 conversion tests passed (the original 11 plus four new regressions).
+New checks simulate a Windows permission lock while replacing progress JSON,
+verify bounded retries publish the latest state after the lock clears, and
+verify a locked temporary progress file is nonfatal. With progress replacement
+denied throughout an actual worker run, STEP/STL exports and the final report
+still succeed and the original file hash stays unchanged. Export write failures
+still produce a failed result rather than being suppressed.
+The four desktop tests were skipped in this run because a display server could
+not start. No UI changes were made. Actual Windows locking remains unverified.
+
+Mac build preparation (subsequent update):
+Added Build-Mac.command and Run-Source-Mac.command with shell syntax checks.
+Confirmed the build script refuses non-Mac execution. Python modules compile.
+Mac uses Helvetica and Add files instructions rather than advertising unsupported
+Finder drag-and-drop. Dependency listings include Python 3.12 wheels for both
+Intel and Apple Silicon; rhino3dm includes a macOS 14 universal2 wheel.
+The scripts build one native architecture at a time with PyInstaller.
+Actual macOS installation, UI behavior, conversion workers, packaging, signing,
+and distribution have not been verified; a Mac build and sample test are needed.
+
+Coworker packaging update:
+NSIS installer configuration compiled successfully on Linux with a fixture
+payload using NSIS 3.09. The fixture is not a working converter and is not
+included in this source download. Four installer-manifest tests passed:
+exact deletion paths, literal dollar escaping, rejecting incomplete bundles,
+and rejecting symlinks. Uninstall uses no recursive folder deletion and
+retains unrelated files/exports. Windows setup is configured per user with
+desktop/Start menu shortcuts and a Settings uninstall entry.
+Mac shell scripts pass bash syntax checks; disk-image packaging, Application
+symlink, bundle versioning and refreshed ad-hoc signing are configured.
+Windows batch execution, native PyInstaller packaging, install/update/uninstall,
+Mac disk-image execution and clean-computer installation are unverified here.
+
+Signed GitHub updater / security update (0.5.0):
+Fresh Linux environment uses cadquery-ocp-novtk 7.8.1.1.post1, rhino3dm 8.35.0,
+NumPy 2.3.5 and cryptography 50.0.2. All 15 conversion tests passed again.
+The complete suite collected 46 tests: 42 passed, four Tk desktop tests skipped
+because no display was available. The 23 updater tests cover signatures,
+tampering, wrong keys/repos, downgrade prevention, fixed asset names, bounded
+metadata/downloads, HTTPS/redirect allowlists, cancellation, hash verification,
+unsafe ZIP paths/links, direct unsigned Mac helper invocation, Mac restart
+rollback, busy conversion guards, and publisher signing across platforms.
+NSIS configuration recompiled with a fixture at version 0.5.0; batch scripts
+remain unexecuted on Windows. Mac shell scripts pass bash syntax checks.
+Workflow YAML parses and all external action references have full commit pins.
+Both runtime and build requirements resolved by pip-audit report no known
+vulnerabilities in the Linux package closure checked. Previous VTK advisories
+were eliminated by removing the unused VTK engine variant, not by suppressing
+findings. See DEPENDENCY-AUDIT.json and BUILD-DEPENDENCY-AUDIT.json.
+No private signing key was generated or included in this download. The default
+repository/public-key configuration is intentionally blank and disables updates
+until the publisher configures it. Live GitHub release jobs, platform installation
+handoffs and native app restart still require testing. See SECURITY.txt for the
+native-parser/sandboxing, signing, rollback and audit limitations.

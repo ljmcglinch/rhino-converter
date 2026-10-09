@@ -1,0 +1,48 @@
+RHINO CONVERTER — OFFICE INSTALLATION
+
+FOR THE PERSON PREPARING THE APP
+Windows: double-click Build-Installer-Windows.bat. It builds the app and
+creates dist\RhinoConverter-Setup.exe. If needed, it installs the free NSIS
+builder using Windows Package Manager. If that is unavailable, the script
+links to the NSIS download. Only your build computer needs Python or NSIS.
+
+Mac: double-click Build-Installer-Mac.command on a Mac with Python 3.12.
+It builds the app and a disk image in dist. Use the arm64 image for Apple
+Silicon, or the x86_64 image for Intel. macOS 14 or newer is required.
+Use a matching native build computer for each architecture.
+
+Before sharing, install the finished package on a test computer and convert
+an office sample. The download contains build files, not finished installers.
+
+WHAT TO SEND TO COWORKERS
+Windows: only RhinoConverter-Setup.exe.
+Mac: only RhinoConverter-Mac-arm64.dmg or RhinoConverter-Mac-x86_64.dmg.
+Do not send the source ZIP or the files in the temporary build folder.
+
+WHAT COWORKERS DO
+Windows: double-click the setup file, click Install, then open Rhino Converter
+using its desktop or Start menu shortcut. Installation is for the current
+user, without requesting administrator access. Uninstall through Windows
+Settings > Apps. An office policy may still restrict installation.
+
+Mac: open the disk image and drag RhinoConverter.app onto Applications.
+Open Rhino Converter from Applications. Use Add files to select models.
+Finder drag-and-drop into the converter is not yet implemented.
+
+Coworkers do not need Rhino, Python, NSIS, pip, or terminal commands.
+All conversion runs locally. An internet connection is needed only when
+the build computer initially downloads its dependencies.
+
+UPDATES
+Build a new installer from updated source, then send the new setup file or
+disk image. Close the app first. Windows setup installs into the same user
+location; on Mac, replace the previous app in Applications.
+Version 0.5.0 includes signed GitHub update checks, downloads and installation
+from the Updates menu. Configure the publisher's repository/signing key before
+building the first release. See GITHUB-UPDATES.txt for setup and future releases.
+
+SIGNING AND DISTRIBUTION
+These scripts do not include your organization's signing credentials.
+Windows setup is unsigned. Mac builds are locally ad-hoc signed, without
+Developer ID signing or notarization. Operating systems may show security
+warnings; have IT sign and approve the release for normal office deployment.

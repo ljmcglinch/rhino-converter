@@ -1,0 +1,1 @@
+{"dependencies": [{"name": "cadquery-ocp-novtk", "version": "7.8.1.1.post1", "vulns": []}, {"name": "rhino3dm", "version": "8.35.0", "vulns": []}, {"name": "numpy", "version": "2.3.5", "vulns": []}, {"name": "cryptography", "version": "50.0.2", "vulns": []}, {"name": "cffi", "version": "2.1.1", "vulns": []}, {"name": "pycparser", "version": "3.1", "vulns": []}], "fixes": []}

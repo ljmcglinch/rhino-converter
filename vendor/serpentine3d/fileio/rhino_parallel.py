@@ -1,0 +1,685 @@
+"""Converting a .3dm across several processes (GitHub #3).
+
+A 65259-object file took about fifteen minutes to open on a 22-core machine,
+and the machine was almost idle throughout. The cost is not our arithmetic and
+not OpenCASCADE: it is rhino3dm's Python binding, where reading one float off
+a point costs 11 us and reaching one mesh vertex costs 25 us — against 0.25 us
+for a plain attribute and 1.67 us for the equivalent OCCT call. A survey mesh
+has millions of vertices, so mesh reading alone is 90% of an import.
+
+That work is Python-side, so it holds the GIL and threads cannot touch it.
+Processes can: objects convert independently. Three things make the difference
+between a fix and a disappointment, all of them measured:
+
+  * **Fork, don't re-read.** A worker that opens the file itself pays ten
+    seconds and a private copy of the model. Forked workers inherit the
+    parent's copy-on-write instead — sixteen of them peaked at 0.32 GB each
+    against a 0.47 GB parent.
+
+  * **Interleave, don't slice.** A drawing keeps its meshes together, so
+    handing each worker a contiguous block of the file gives one of them every
+    expensive object: 6.5x collapsed to 1.5x until the batches were strided.
+
+  * **Spawn the reader.** The app cannot fork: its tessellation threads hold
+    locks a forked child would inherit already locked and wait on forever. So
+    one thread-free process is spawned, and *it* reads the file and forks the
+    converters.
+
+  * **Share out the one object nobody else can help with.** Sharing objects
+    out means a drawing converts no faster than its dearest single object. A
+    survey file ends in two meshes of 6.6 million vertices, fifty seconds
+    each, and the last fifty-eight seconds of a seventy-four second import
+    were fifteen workers watching one read a mesh. Past SPLIT_VERTICES a mesh
+    is read in vertex ranges by the whole pool instead: 74 s to 32 s, and the
+    object itself 59.5 s to 6.2 s.
+
+Shapes come back down a pipe. A MeshShape is numpy and pickles as it stands;
+a TopoDS_Shape does not pickle at all — it aborts the interpreter — so it
+travels as a BinTools archive, about 6 KB and half a millisecond each.
+
+On a 10474-object file this took conversion from 86 s to 8 s.
+"""
+
+from __future__ import annotations
+
+import io
+import math
+import multiprocessing as mp
+import os
+import traceback
+
+import numpy as np
+import rhino3dm as r3
+
+from ..core.mesh import MeshShape
+from ..utils.spawn import spawn_executable as _spawn_executable
+from .progress import Progress
+
+# Set once in the reader process; forked converters inherit it, and on
+# platforms without fork each fills it in for itself. The layer and material
+# tables come with it: a worker resolves an object's colour itself.
+_MODEL = None
+_LAYERS: dict = {}
+_MATERIALS: dict = {}
+_BLOCKS: dict = {}
+
+# Spawning a process and importing the kernel into it costs a couple of
+# seconds, which most .3dm files do not take to convert in the first place.
+MIN_PARALLEL_BYTES = 8 * 1024 * 1024
+
+# Objects per task. Small enough that progress moves and the pool can even
+# out a straggler, large enough that the per-task overhead disappears.
+BATCH = 64
+
+# Past about sixteen the pipe, not the conversion, is the limit.
+MAX_WORKERS = 16
+
+# Where a worker would put an encoded shape for an object it deliberately
+# did not convert. What follows it is the object's index in the file and
+# the kind the file claims, which is all the parent needs to come back for
+# it later. See `rhino.worth_deferring`.
+DEFERRED = "deferred"
+
+# Without fork every worker holds its own copy of the model, so the ceiling
+# is memory rather than cores.
+MAX_WORKERS_WITHOUT_FORK = 4
+
+# Vertices past which one mesh is read by several workers instead of one.
+# Objects are shared out, so a drawing converts as fast as its dearest single
+# object: the cave file's last two are 6.6 million vertices each, fifty
+# seconds apiece, and for those fifty seconds fifteen of the sixteen workers
+# had nothing to do and the bar sat at 93%. Below the threshold the round trip
+# through the pool costs more than the reading.
+SPLIT_VERTICES = 200_000
+
+# Faces past which one brep is converted by several workers instead of one.
+# Same reasoning at cab scale: a 19105-face unioned polysurface is about two
+# minutes of trim recovery, and nobody else can touch it while one worker
+# grinds. Below the threshold each worker rebuilding the brep's edge table
+# for itself costs more than the sharing saves.
+SPLIT_FACES = 512
+
+
+def _available_cores() -> int:
+    """Cores this process may actually run on, not the ones the box has.
+
+    A container, a cgroup or a taskset can leave us with fewer, and a worker
+    per core we cannot be scheduled on only adds contention.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:                          # not Linux
+        return os.cpu_count() or 1
+
+
+def worker_count(requested: int | None = None) -> int:
+    """How many converters to run. SERP3D_IMPORT_WORKERS=1 forces serial."""
+    if requested is None:
+        requested = os.environ.get("SERP3D_IMPORT_WORKERS")
+    if requested:
+        try:
+            return max(1, int(requested))
+        except (TypeError, ValueError):
+            pass
+    cap = MAX_WORKERS if hasattr(os, "fork") else MAX_WORKERS_WITHOUT_FORK
+    return max(1, min(cap, _available_cores()))
+
+
+def split_vertices(requested: int | None = None) -> int:
+    """Vertices past which a mesh is worth more than one worker.
+
+    SERP3D_IMPORT_SPLIT_VERTICES overrides it. The reader is a process of its
+    own, so that is also how a test says so.
+    """
+    if requested is None:
+        requested = os.environ.get("SERP3D_IMPORT_SPLIT_VERTICES")
+    if requested:
+        try:
+            return max(1, int(requested))
+        except (TypeError, ValueError):
+            pass
+    return SPLIT_VERTICES
+
+
+def split_faces(requested: int | None = None) -> int:
+    """Faces past which a brep is worth more than one worker.
+
+    SERP3D_IMPORT_SPLIT_FACES overrides it, the same way the vertex
+    threshold travels.
+    """
+    if requested is None:
+        requested = os.environ.get("SERP3D_IMPORT_SPLIT_FACES")
+    if requested:
+        try:
+            return max(1, int(requested))
+        except (TypeError, ValueError):
+            pass
+    return SPLIT_FACES
+
+
+def _piece_count(vertices: int, workers: int, limit: int) -> int:
+    """How many pieces one mesh is worth.
+
+    A piece of `limit` vertices, rather than one worker's share of the mesh:
+    more pieces than workers pack the pool tighter when several meshes are
+    split at once, and each one is a line on the dialog, so the sentence
+    changes every second or two instead of once a wave. The ceiling is there
+    to stop a preposterous mesh from becoming thousands of round trips.
+    """
+    if limit <= 0 or vertices <= limit:
+        return 1
+    return max(2, min(4 * workers, math.ceil(vertices / limit)))
+
+
+def _pieces(count: int, parts: int) -> list[tuple[int, int]]:
+    """`count` items as exactly `parts` contiguous [lo, hi) ranges.
+
+    Contiguous, unlike the batches: the pieces are concatenated back together
+    in order, and a face indexes its vertices by position. Exactly `parts` of
+    them, empty ones included, so a mesh's vertex ranges and its face ranges
+    pair off even when it has fewer faces than there are workers.
+    """
+    parts = max(1, parts)
+    edges = [count * k // parts for k in range(parts + 1)]
+    return list(zip(edges[:-1], edges[1:]))
+
+
+def _batches(total: int, size: int = BATCH) -> list[list[int]]:
+    """Object indices in `total // size` interleaved batches.
+
+    Strided rather than sliced: batch k is every count'th object, so each one
+    samples the whole drawing and no single batch inherits the region where
+    the scanned meshes live.
+    """
+    if total <= 0:
+        return []
+    count = max(1, math.ceil(total / size))
+    return [list(range(k, total, count)) for k in range(count)]
+
+
+# ---------------------------------------------------------- down the pipe
+
+def _downcasts() -> dict:
+    """{shape type: core.occ downcast function name}. Built once, lazily,
+    so importing this module does not drag the kernel in."""
+    from ..core import occ
+    return {occ.VERTEX: "to_vertex", occ.EDGE: "to_edge", occ.WIRE: "to_wire",
+            occ.FACE: "to_face", occ.SHELL: "to_shell",
+            occ.SOLID: "to_solid", occ.COMPOUND: "to_compound"}
+
+
+_DOWNCAST = None
+
+
+def _encode(shape):
+    """A shape as something pickle can carry."""
+    if isinstance(shape, MeshShape):
+        return ("mesh", shape.vertices, shape.triangles, shape.normals)
+    from OCP.BinTools import BinTools
+    buf = io.BytesIO()
+    BinTools.Write_s(shape, buf)
+    return ("occ", buf.getvalue(), None, None)
+
+
+def _decode(payload):
+    kind, first, second, third = payload
+    if kind == "mesh":
+        return MeshShape(first, second, third)
+    from OCP.BinTools import BinTools
+    from OCP.TopoDS import TopoDS_Shape
+    shape = TopoDS_Shape()
+    BinTools.Read_s(shape, io.BytesIO(first))
+    # BinTools answers a bare TopoDS_Shape whatever it was handed, and OCCT's
+    # bindings reject one where they want a TopoDS_Edge. Put the class back,
+    # so nothing downstream can tell which process built the object.
+    global _DOWNCAST
+    if _DOWNCAST is None:
+        _DOWNCAST = _downcasts()
+    cast = _DOWNCAST.get(shape.ShapeType())
+    if cast is None:
+        return shape
+    from ..core import occ
+    return getattr(occ, cast)(shape)
+
+
+# -------------------------------------------------------------- converting
+
+def _init_worker(path: str):
+    """Fill in the model only where fork did not hand one over."""
+    global _MODEL, _LAYERS, _MATERIALS, _BLOCKS
+    from . import rhino
+
+    if _MODEL is None:
+        _MODEL = r3.File3dm.Read(path)
+    # Once per worker rather than once per batch: a drawing has thousands of
+    # objects and a few dozen layers.
+    _LAYERS = rhino.read_layers(_MODEL)
+    _MATERIALS = rhino.read_materials(_MODEL)
+    _BLOCKS = rhino.read_blocks(_MODEL)
+
+
+def _convert(indices: list[int]):
+    """[(index, [(name, appearance, [encoded shape])], size)] for one batch.
+
+    Appearance is resolved here rather than by the reader, because working out
+    where an object's colour comes from means reading its attributes, and that
+    is exactly the per-object binding cost the pool exists to share out.
+
+    One object is usually one named group of shapes, but a block instance is
+    as many as the definition it places has members, each with a name and a
+    colour of its own — so the answer is a list of them and not a single name.
+    An object that brings nothing at all, which is what a definition's own
+    content is, answers with an empty one.
+
+    An object too big for one worker is not converted here. Its size comes
+    back instead — ("mesh", vertices, faces) or ("brep", faces) — and the
+    reader shares the work out; everything else answers with `size` None and
+    its shapes.
+    """
+    from . import rhino
+
+    limit = split_vertices()
+    flimit = split_faces()
+    out = []
+    for i in indices:
+        obj = _MODEL.Objects[i]
+        geo = obj.Geometry
+        attrs = obj.Attributes
+        if attrs.IsInstanceDefinitionObject:
+            # Kept in the object table but not in the drawing: only the
+            # instances that place it put it anywhere.
+            out.append((i, [], None))
+            continue
+        meta = rhino.object_appearance(attrs, _LAYERS, _MATERIALS)
+        if rhino.worth_deferring(geo, meta):
+            # Nothing to convert and so nothing to send back: the object
+            # index and the kind the file claims are enough for the parent
+            # to come back for it if anything ever asks (GitHub #5). Ahead
+            # of the size checks below on purpose — a survey mesh switched
+            # off is exactly the object worth not converting.
+            out.append((i, [(attrs.Name or "", meta,
+                             [(DEFERRED, i, rhino.file_kind(geo))])], None))
+            continue
+        if isinstance(geo, r3.Mesh) and len(geo.Vertices) > limit:
+            out.append((i, [(attrs.Name or "", meta, [])],
+                        ("mesh", len(geo.Vertices), len(geo.Faces))))
+            continue
+        if isinstance(geo, r3.Brep) and len(geo.Faces) > flimit:
+            out.append((i, [(attrs.Name or "", meta, [])],
+                        ("brep", len(geo.Faces))))
+            continue
+        if isinstance(geo, r3.InstanceReference):
+            # Expanded whole, however big its members are: sharing one out
+            # would mean reading a mesh in ranges and then placing the ranges
+            # separately, and a definition holding a survey mesh is not a
+            # drawing anyone has yet brought us.
+            name = rhino.placed_block_name(attrs, geo, _BLOCKS, i)
+            try:
+                parts = rhino.instance_to_objects(geo, name, meta, _BLOCKS,
+                                                  _LAYERS, _MATERIALS)
+            except Exception:                                   # noqa: BLE001
+                parts = []
+            out.append((i, [(part_name, part_meta, [_encode(shape)])
+                            for part_name, shape, part_meta in parts], None))
+            continue
+        try:
+            shapes = rhino.object_to_shapes(geo)
+        except Exception:                                       # noqa: BLE001
+            shapes = []
+        encoded = [_encode(s) for s in shapes
+                   if s is not None and not s.IsNull()]
+        out.append((i, [(attrs.Name or "", meta, encoded)], None))
+    return out
+
+
+def _read_piece(job):
+    """One slice of one mesh: (object index, piece number, vertices, tris).
+
+    Indexed, not iterated, because a worker starting part way in has no
+    cheaper way to get there: skipping to the middle with islice costs nearly
+    half what reading it does. Index once per vertex and read the three
+    coordinates off what comes back — `vl[i].X, vl[i].Y, vl[i].Z` builds three
+    points and costs twice as much as building one.
+    """
+    index, part, vlo, vhi, flo, fhi = job
+    mesh = _MODEL.Objects[index].Geometry
+    vl = mesh.Vertices
+    rows = []
+    for i in range(vlo, vhi):
+        v = vl[i]
+        rows.append((v.X, v.Y, v.Z))
+    fl = mesh.Faces
+    tris = []
+    for i in range(flo, fhi):
+        a, b, c, d = fl[i]
+        tris.append((a, b, c))
+        if d != c:
+            tris.append((a, c, d))
+    return (index, part,
+            np.array(rows, float).reshape(-1, 3),
+            np.array(tris, np.uint32).reshape(-1, 3))
+
+
+# One brep's edge table per worker: pieces of the same brep land on the same
+# worker more than once, and rebuilding 48k edges per piece would eat what
+# the sharing saves. Kept to the brep in hand — two giants rarely interleave,
+# and the table is most of a gigabyte-file's edges.
+_BREP_CACHE: dict = {}
+
+
+def _brep_piece(job):
+    """One run of faces of one brep: (object index, piece number, [encoded]).
+
+    The faces convert independently; only sewing them back together needs
+    them all, and the reader does that when the last piece lands.
+    """
+    index, part, flo, fhi = job
+    from . import rhino
+    brep = _MODEL.Objects[index].Geometry
+    cached = _BREP_CACHE.get(index)
+    if cached is None:
+        cached = rhino._brep_edge_context(brep)
+        _BREP_CACHE.clear()
+        _BREP_CACHE[index] = cached
+    shapes = []
+    for fi in range(flo, fhi):
+        shapes.extend(rhino._face_shapes(brep, fi, *cached))
+    return (index, part, [_encode(s) for s in shapes
+                          if s is not None and not s.IsNull()])
+
+
+def _convert_piece(job):
+    """One slice of one deferred object, whichever kind it is."""
+    if job[0] == "mesh":
+        return ("mesh", *_read_piece(job[1:]))
+    return ("brep", *_brep_piece(job[1:]))
+
+
+def _convert_in_pool(path: str, workers: int, cancel=None):
+    """Read the file, convert it across `workers` processes, yield as it goes.
+
+    Messages are ("status", fraction, text), ("total", n) and
+    ("batch", done, total, results). Runs in the spawned reader process, but is
+    a plain generator so it can also be driven in-process.
+    """
+    global _MODEL
+
+    yield ("status", 0.0, f"Reading {os.path.basename(path)}…")
+    _MODEL = r3.File3dm.Read(path)
+    if _MODEL is None:
+        raise IOError(f"Could not read 3dm file: {path}")
+
+    total = len(_MODEL.Objects)
+    yield ("total", total)
+    batches = _batches(total)
+    if not batches:
+        return
+
+    ctx = mp.get_context("fork" if hasattr(os, "fork") else "spawn")
+    done = 0
+    deferred = {}
+    with ctx.Pool(min(workers, len(batches)),
+                  initializer=_init_worker, initargs=(path,)) as pool:
+        for results in pool.imap_unordered(_convert, batches):
+            if cancel is not None and cancel.is_set():
+                pool.terminate()
+                return
+            rows = []
+            for index, parts, size in results:
+                if size is not None:
+                    deferred[index] = (parts[0][0], parts[0][1], size)
+                    continue
+                # Counted whether or not it brought anything with it: a
+                # definition's own content is an object the workers are done
+                # with, and leaving it out held the bar short of the end.
+                done += 1
+                if parts:
+                    rows.append((index, parts))
+            yield ("batch", done, total, rows)
+        if deferred:
+            yield from _share_out(pool, deferred, done, total, workers, cancel)
+
+
+def _share_out(pool, deferred, done, total, workers, cancel):
+    """Read the objects too big for one worker across the whole pool.
+
+    They are left till last because nothing knows an object's size until a
+    worker has looked at it, and asking beforehand means the reader walking
+    the file alone. By the time they come round the pool is otherwise idle,
+    so the pieces of every deferred object go in together and the last one
+    finishes in about the time one worker would have needed for a sixteenth
+    of it. Meshes split into vertex ranges and breps into face ranges, and
+    both kinds ride one queue so neither waits on the other.
+    """
+    limit = split_vertices()
+    flimit = split_faces()
+    jobs, held = [], {}
+    for index, (_, _meta, size) in deferred.items():
+        if size[0] == "mesh":
+            _, vertices, faces = size
+            parts = _piece_count(vertices, workers, limit)
+            spans = zip(_pieces(vertices, parts), _pieces(faces, parts))
+            held[index] = [None] * parts
+            for part, ((vlo, vhi), (flo, fhi)) in enumerate(spans):
+                jobs.append(("mesh", index, part, vlo, vhi, flo, fhi))
+        else:
+            parts = _piece_count(size[1], workers, flimit)
+            held[index] = [None] * parts
+            for part, (flo, fhi) in enumerate(_pieces(size[1], parts)):
+                jobs.append(("brep", index, part, flo, fhi))
+
+    # The object count cannot move while a single object is in hand, so the
+    # pieces report instead — a bar that stops is a bar that has hung.
+    lo, span = done / (total or 1), len(deferred) / (total or 1)
+    for k, result in enumerate(
+            pool.imap_unordered(_convert_piece, jobs), 1):
+        if cancel is not None and cancel.is_set():
+            pool.terminate()
+            return
+        kind, index, part = result[0], result[1], result[2]
+        pieces = held[index]
+        pieces[part] = result[3:] if kind == "mesh" else result[3]
+        yield ("status", lo + span * k / len(jobs),
+               f"Converting large objects, {k} of {len(jobs)} pieces")
+        if all(piece is not None for piece in pieces):
+            name, meta, _ = deferred[index]
+            if kind == "mesh":
+                encoded = [_encode(MeshShape(
+                    np.concatenate([piece[0] for piece in pieces]),
+                    np.concatenate([piece[1] for piece in pieces])))]
+            else:
+                # Sewing wants every face at once, and it is cheap next to
+                # converting them — about a second for 19k faces — so the
+                # reader does it here rather than holding the pool hostage.
+                from . import rhino
+                shapes = [_decode(p) for piece in pieces for p in piece]
+                encoded = [_encode(s) for s in rhino._assemble_faces(shapes)
+                           if s is not None and not s.IsNull()]
+            del held[index]
+            done += 1
+            yield ("batch", done, total,
+                   [(index, [(name, meta, encoded)])])
+
+
+def _read_file(path: str, workers: int, conn, cancel):
+    """The spawned reader: forward the conversion down the pipe.
+
+    Errors travel too. A file that will not open has to raise in the caller,
+    not come back as an import that found nothing.
+    """
+    stream = _convert_in_pool(path, workers, cancel)
+    try:
+        for message in stream:
+            conn.send(message)
+    except BaseException as exc:                                # noqa: BLE001
+        report = traceback.format_exc()
+        try:
+            conn.send(("error", exc, report))
+        except Exception:                                       # noqa: BLE001
+            conn.send(("error", None, report))                  # unpicklable
+    finally:
+        stream.close()          # unwinds the `with`, so the pool is stopped
+        conn.close()
+
+
+# ---------------------------------------------------------------- assembly
+
+def _messages(conn, interval: float = 0.05):
+    """The reader's messages, with a heartbeat while it has nothing to say.
+
+    The caller drives this from its UI thread, so a plain blocking recv()
+    froze the window and deafened Cancel for as long as a batch took. On the
+    file that started all this that was the whole import: a dialog that never
+    painted, then a bar that stopped at 98% with no way out.
+    """
+    while True:
+        if not conn.poll(interval):
+            yield ("waiting",)
+            continue
+        try:
+            yield conn.recv()
+        except EOFError:
+            return
+
+
+def _is_deferred(payload) -> bool:
+    """Whether a worker sent a promise of geometry instead of geometry."""
+    return (isinstance(payload, tuple) and len(payload) == 3
+            and payload[0] == DEFERRED)
+
+
+def _assemble(messages, report, opening: str = "",
+              path: str = "") -> list[tuple[str, object, dict]]:
+    """Turn the reader's message stream into what import_3dm returns.
+
+    Shapes are decoded as they land rather than at the end, so the bytes are
+    freed while the workers are still busy and the parent is not left holding
+    the whole file twice over.
+
+    What a worker chose not to convert comes back as a marker instead of
+    bytes, and is turned into a `DeferredShape` at the end, once the count
+    of them is known and they can share one reopening of the file.
+    """
+    total, rows = None, []
+    # What to repaint between messages. The bar must not creep while the
+    # helper is thinking, so a heartbeat repeats the last real update rather
+    # than inventing one.
+    # The helper takes a moment to start, and a dialog with no words in it
+    # reads as a hang. We know the filename without asking it.
+    latest = (0.0, opening)
+    for message in messages:
+        kind = message[0]
+        if kind == "batch":
+            _, done, total, results = message
+            rows.extend((index, [(name, meta,
+                                  [p if _is_deferred(p) else _decode(p)
+                                   for p in encoded])
+                                 for name, meta, encoded in parts])
+                        for index, parts in results)
+            latest = (done / (total or 1),
+                      f"Converting object {done} of {total}")
+            report(*latest)
+        elif kind == "waiting":
+            report(*latest)
+        elif kind == "status":
+            latest = (message[1], message[2])
+            report(*latest)
+        elif kind == "total":
+            total = message[1]
+        elif kind == "error":
+            exc, text = message[1], message[2]
+            raise exc if isinstance(exc, BaseException) else RuntimeError(text)
+
+    # A reader can die before it can say why — a bundle whose spawned
+    # interpreter cannot find the kernel, an OOM kill. The pipe simply closes,
+    # and an import of nothing is indistinguishable from a file of nothing.
+    # Counting the objects is the reader's first act after opening the file,
+    # so having no count at all means it never got that far.
+    if total is None:
+        raise RuntimeError("the import helper stopped before reading the file")
+
+    # Batches finish out of order; the scene should not depend on which
+    # worker was quickest, and the fallback names count in file order.
+    rows.sort(key=lambda row: row[0])
+    # One reader for all of them, so that ticking a hidden layer back on
+    # opens the file once rather than once an object.
+    owed = sum(1 for _, parts in rows
+               for _, _, shapes in parts for s in shapes if _is_deferred(s))
+    pending = rhino_module().PendingFile(path, owed) if owed else None
+
+    out, counter = [], 0
+    for _, parts in rows:
+        for name, meta, shapes in parts:
+            for shape in shapes:
+                counter += 1
+                if _is_deferred(shape):
+                    shape = rhino_module()._deferred_from_file(
+                        pending, shape[1], shape[2])
+                out.append((name or f"3dm object {counter:02d}", shape, meta))
+    return out
+
+
+def rhino_module():
+    """The sibling importer, imported late: it imports this one at module
+    level, and the two cannot both come first."""
+    from . import rhino
+    return rhino
+
+
+def import_3dm_parallel(path: str, progress=None,
+                        workers: int | None = None
+                        ) -> list[tuple[str, object, dict]]:
+    """import_3dm's answer, converted across processes.
+
+    The reader is spawned rather than forked because the caller is a running
+    Qt app whose tessellation threads hold locks a forked child would inherit
+    held. The reader has no threads, so it can fork its own converters.
+    """
+    report = progress or Progress()
+    ctx = mp.get_context("spawn")
+    interpreter = _spawn_executable()
+    if interpreter is None:
+        raise RuntimeError("no interpreter to run the import helper")
+    ctx.set_executable(interpreter)
+    cancel = ctx.Event()
+    receiver, sender = ctx.Pipe(duplex=False)
+    # Not daemonic: a daemon may not have children, and the reader's whole
+    # job is to fork some. The `finally` below stops it instead, and if the
+    # app dies outright the pipe breaks under the reader's next send.
+    proc = ctx.Process(target=_read_file,
+                       args=(path, worker_count(workers), sender, cancel))
+    proc.start()
+    sender.close()          # or the parent never sees the pipe close
+    finished = False
+    try:
+        # _assemble returns only once the message stream ends, which is the
+        # reader closing the pipe — so a normal return means it got to the end.
+        items = _assemble(_messages(receiver), report,
+                          f"Reading {os.path.basename(path)}…", path)
+        finished = True
+        return items
+    finally:
+        _stop(proc, cancel, finished)
+        receiver.close()
+
+
+def _stop(proc, cancel, finished: bool) -> None:
+    """Let the reader go.
+
+    Closing the pipe is its last act after stopping its pool, so a reader that
+    got that far has nothing of ours left running in it — only a spawned
+    interpreter unloading OCP and rhino3dm, which takes about two seconds. We
+    used to spend them inside a join, and a join reports nothing, so the bar
+    sat frozen at 95% with every object already converted. Nobody is waiting
+    on that exit, so we stop watching it.
+
+    Bailing out is the opposite. The reader is mid-file with a pool of forked
+    converters below it, and killing it there reparents them onto init, still
+    chewing through the file with nobody left to read their answers. So it is
+    asked to stop and given time to take its children with it.
+    """
+    cancel.set()
+    proc.join(timeout=0.2 if finished else 2)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=5)

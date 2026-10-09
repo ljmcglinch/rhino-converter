@@ -1,0 +1,42 @@
+SECURITY DESIGN AND CHECKS — 2026-10-09
+
+The app has no web server, upload endpoint or conversion service. The updater
+requests only release metadata and packages; it sends no models or filenames.
+Conversion works from a temporary source copy and never writes the original.
+The Windows installer runs as the current user, without requesting elevation.
+
+Update metadata is verified with a pinned Ed25519 public key before its contents
+are used. Downloads must match the signed hash, size, repository, version and
+fixed platform-specific filename. Only HTTPS GitHub release hosts and approved
+redirect hosts are allowed. No tokens, private keys or remote shell commands
+are bundled. Update threads do not manipulate Tk or stop conversion. Installation
+requires user confirmation and is blocked while conversion/review is active.
+The Mac helper re-verifies signed metadata, checks archives for traversal and
+unsafe symlinks, checks the app's code signature, swaps on the same filesystem,
+and retains the previous app for rollback. The Windows helper rechecks the hash
+after the main app exits and launches the bundled per-user installer.
+
+DEPENDENCY REVIEW
+The previous cadquery-ocp package pulled in vtk 9.3.1. pip-audit reported three
+known vulnerabilities: PYSEC-2025-224, PYSEC-2025-225 and PYSEC-2025-226.
+This version uses cadquery-ocp-novtk instead, removing that unused renderer and
+its dependency chain. A clean environment's conversion tests passed using it.
+The runtime dependency audit reports no known vulnerabilities for the resolved
+packages checked. Native library code and the vendored geometry importer are
+not comprehensively covered by this Python advisory scan.
+Build scripts audit runtime and build dependencies and stop on audit failure.
+GitHub Actions are pinned to verified commit hashes. Dependabot configuration
+proposes dependency/action updates weekly; updates still need review and tests.
+The signing secret is available only in the separate release environment/job.
+
+LIMITS REQUIRING REVIEW BEFORE BROAD DEPLOYMENT
+Native CAD readers run with the current user's permissions. A child process
+isolates crashes but is not an OS security sandbox. Treat model files as trusted
+office inputs until native-reader threat modeling and sandboxing are completed.
+Windows silent update installation is not transactional; a setup failure may
+require rerunning the installer. Mac rollback covers replacement/open command
+failure but does not prove the new app reached a healthy startup.
+Platform installer/update handoffs and the live GitHub workflow remain untested
+in this Linux environment. GUI tests require an available display.
+Dependency advisories change; repeat checks for every release. No independent
+penetration test or complete native-code security audit has been performed.

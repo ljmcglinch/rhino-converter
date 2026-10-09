@@ -1,0 +1,79 @@
+RHINO CONVERTER — SIGNED GITHUB UPDATES
+
+ONE-TIME PUBLISHER SETUP
+Public-key-only setup (recommended when a signing key is managed elsewhere):
+  python release_tools.py configure-public --repository OWNER/REPOSITORY --public-key BASE64_PUBLIC_KEY
+This writes only public configuration and does not read or create a private key.
+Use the real repository and a base64-encoded 32-byte Ed25519 public key.
+Then run before tagging:
+  python release_tools.py validate --repository OWNER/REPOSITORY --tag v0.5.3
+The preflight rejects invalid keys, repository mismatches and version mismatches.
+Changing an already pinned key or repository requires a migration plan.
+The configure command below is an optional publisher key-generation workflow;
+do not run it when you only intend to prepare public configuration.
+
+1. Create a GitHub repository for this app. This first updater uses public
+   release downloads, so use a public repository without office CAD files.
+   No GitHub tokens are embedded in the app. Private release authentication
+   has not been implemented.
+2. On your build computer, close the converter and extract this source update
+   over the existing folder, keeping .venv. Run Configure-Updates.bat on Windows
+   or Configure-Updates-Mac.command on Mac. Enter your GitHub owner/repository.
+   The script migrates dependencies, creates a signing key OUTSIDE the project,
+   and writes only the repository name and PUBLIC key to update-config.json.
+3. Back up the private signing-key.txt file securely. Never commit it or share
+   it with coworkers. App builds do not include this private key.
+4. In GitHub Settings > Environments, create an environment named release.
+   Add the contents of the private file as its UPDATE_SIGNING_KEY secret.
+   Restrict the environment to release tags and require a trusted reviewer.
+   Protect the main branch, release tags, and changes to the release workflow.
+5. Commit the CONTENTS of the rhino-converter folder at the repository root,
+   including .github, update-config.json and VERSION.txt. Exclude .venv, build,
+   dist, private keys, and office models. The supplied .gitignore covers common
+   build outputs and private-key extensions.
+6. Push a version tag matching VERSION.txt, currently v0.5.3. GitHub Actions
+   builds Windows setup plus Apple Silicon/Intel Mac packages, runs checks,
+   and pauses at the protected release environment. After approval it signs
+   metadata and publishes the complete release. The reviewer should review
+   the code and packages before authorizing access to the signing secret.
+7. Install and test this first release on both platforms. Coworkers need this
+   updater-containing version installed once before future in-app updates work.
+
+FUTURE RELEASES
+Update the source and increase VERSION.txt, for example to 0.5.1. Commit and
+push the matching v0.5.1 tag. The workflow builds packages and publishes only
+after all matrix builds succeed and the release environment permits signing.
+The build fails if the dependency audit fails; advisories are not ignored.
+
+COWORKER EXPERIENCE
+The app checks GitHub in the background when it opens. It also has an Updates
+menu for Check for updates, Download update, Install update, and Cancel download.
+After download, the file must match the signed release size and SHA-256 hash.
+Installation is blocked while conversion or a review is active. On Windows,
+the helper waits for the app to exit, runs the per-user setup, then reopens it.
+On a packaged Mac app, the helper verifies the signature again, validates the
+archive, checks its code signature, waits for the app to exit, replaces the
+bundle and reopens it. It keeps the previous app as a rollback copy beside it.
+The Mac user needs write access to the containing Applications directory.
+Source-mode Windows updates install the packaged app; they do not rewrite
+the source checkout. Mac automatic installation requires a packaged .app.
+
+FAILURE BEHAVIOR
+Missing configuration, unavailable GitHub, invalid signatures, altered hashes,
+unexpected assets, unsupported platforms and older versions never trigger an
+installation. Failed checks do not stop conversion. A Mac replacement or
+restart failure restores the previous bundle. A Windows installer failure
+leaves an install-error.txt next to the downloaded package; Windows installer
+rollback after a partial setup failure has not been implemented.
+
+TRUST AND LIMITS
+Updates trust the public key bundled in the installed app, not arbitrary release
+metadata. Signing-key replacement is refused by the configuration tool; a key
+rotation needs a deliberate migration for existing installs. The publisher's
+signing key and repository access must be protected. Compromise of the signing
+key or a trusted release workflow defeats this trust model.
+Ed25519 update signatures do not replace Windows Authenticode or Apple Developer
+ID signing/notarization. IT signing is still needed for smooth OS distribution.
+Native Windows/Mac update installation and the live GitHub workflow need testing
+on those systems before office rollout. No GitHub repository was created or
+release published by producing this download.

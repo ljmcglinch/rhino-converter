@@ -1,0 +1,1807 @@
+"""Rhino .3dm import/export via rhino3dm.
+
+Import: NURBS curves are converted exactly (poles/weights/knots); breps,
+extrusions and NURBS surfaces come in as untrimmed NURBS faces; meshes are
+sewn into shells. Layers (names/colors) are preserved both ways.
+
+Export: curves as exact NURBS; surfaces and solids as meshes (render
+meshes — Rhino re-imports them fine; exact BREP export goes via STEP).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+
+import numpy as np
+import rhino3dm as r3
+from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+
+from ..core import geometry, occ
+from ..core.deferred import DeferredShape
+from ..core.layers import PATH_SEPARATOR
+from ..core.occ import (
+    BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, Geom_BSplineCurve,
+    TColStd_Array1OfInteger, TColStd_Array1OfReal, TColgp_Array1OfPnt,
+    gp_Pnt,
+)
+from ..core.tessellate import tessellate
+from .obj import _shell_from_triangles
+from .progress import Cancelled, Progress
+# Safe to import at module level: the parallel importer only reaches back
+# into this module from inside its functions.
+from .rhino_parallel import (MIN_PARALLEL_BYTES, _spawn_executable,
+                             import_3dm_parallel, worker_count)
+
+# Rhino's own numbering, read once here rather than looked up per object:
+# 11759 objects is 11759 enum constructions otherwise.
+_COLOR_FROM_OBJECT = int(r3.ObjectColorSource.ColorFromObject)
+_COLOR_FROM_MATERIAL = int(r3.ObjectColorSource.ColorFromMaterial)
+_COLOR_FROM_PARENT = int(r3.ObjectColorSource.ColorFromParent)
+_MATERIAL_FROM_OBJECT = int(r3.ObjectMaterialSource.MaterialFromObject)
+# Rhino's shine is 0..255, where 255 is a mirror.
+MAX_SHINE = 255.0
+
+
+# ------------------------------------------------------------------ knots
+
+def _rhino_knots_to_occ(knots: list[float]):
+    """Rhino knot list -> (distinct knots, multiplicities) with clamped ends."""
+    distinct, mults = [], []
+    for k in knots:
+        if distinct and abs(k - distinct[-1]) < 1e-12:
+            mults[-1] += 1
+        else:
+            distinct.append(k)
+            mults.append(1)
+    mults[0] += 1        # Rhino omits the superfluous end knots
+    mults[-1] += 1
+    return distinct, mults
+
+
+def _occ_knots_to_rhino(distinct: list[float], mults: list[int]) -> list[float]:
+    out = []
+    for i, (k, m) in enumerate(zip(distinct, mults)):
+        count = m - 1 if i in (0, len(distinct) - 1) else m
+        out.extend([k] * count)
+    return out
+
+
+# ------------------------------------------------------------------ curves
+
+def _r3_curve_to_shape(curve: r3.Curve):
+    nc = curve if isinstance(curve, r3.NurbsCurve) else curve.ToNurbsCurve()
+    n = len(nc.Points)
+    degree = nc.Degree
+    knots = [nc.Knots[i] for i in range(len(nc.Knots))]
+    distinct, mults = _rhino_knots_to_occ(knots)
+
+    clamped = (sum(mults) == n + degree + 1
+               and mults[0] == degree + 1 and mults[-1] == degree + 1)
+    if not clamped:
+        # periodic or exotic curve: sample and interpolate
+        t0, t1 = nc.Domain.T0, nc.Domain.T1
+        samples = max(32, n * 4)
+        pts = []
+        for i in range(samples + 1):
+            p = nc.PointAt(t0 + (t1 - t0) * i / samples)
+            pts.append((p.X, p.Y, p.Z))
+        if nc.IsClosed:
+            return geometry.make_interp_curve(pts[:-1], closed=True)
+        return geometry.make_interp_curve(pts)
+
+    poles = TColgp_Array1OfPnt(1, n)
+    weights = TColStd_Array1OfReal(1, n)
+    rational = nc.IsRational
+    for i in range(n):
+        cp = nc.Points[i]     # rhino stores homogeneous (premultiplied) coords
+        w = cp.W if rational and cp.W > 1e-12 else 1.0
+        poles.SetValue(i + 1, gp_Pnt(cp.X / w, cp.Y / w, cp.Z / w))
+        weights.SetValue(i + 1, w)
+    k_arr = TColStd_Array1OfReal(1, len(distinct))
+    m_arr = TColStd_Array1OfInteger(1, len(distinct))
+    for i, (k, m) in enumerate(zip(distinct, mults), start=1):
+        k_arr.SetValue(i, float(k))
+        m_arr.SetValue(i, int(m))
+    bs = Geom_BSplineCurve(poles, weights, k_arr, m_arr, degree, False)
+    return BRepBuilderAPI_MakeEdge(bs).Edge()
+
+
+def _shape_to_r3_curve(shape) -> r3.NurbsCurve | None:
+    try:
+        bs = geometry._edge_bspline(shape)
+    except geometry.GeometryError:
+        return None
+    n = bs.NbPoles()
+    degree = bs.Degree()
+    # (dimension, rational, order, count) — the 2-arg ctor is non-rational
+    nc = r3.NurbsCurve(3, True, degree + 1, n)
+    for i in range(n):
+        p = bs.Pole(i + 1)
+        w = bs.Weight(i + 1)
+        nc.Points[i] = r3.Point4d(p.X() * w, p.Y() * w, p.Z() * w, w)
+    distinct = [bs.Knot(i + 1) for i in range(bs.NbKnots())]
+    mults = [bs.Multiplicity(i + 1) for i in range(bs.NbKnots())]
+    rhino_knots = _occ_knots_to_rhino(distinct, mults)
+    if len(rhino_knots) != len(nc.Knots):
+        return None
+    for i, k in enumerate(rhino_knots):
+        nc.Knots[i] = k
+    return nc
+
+
+# ---------------------------------------------------------------- surfaces
+
+def _r3_surface_to_face(srf: r3.Surface):
+    ns = srf if isinstance(srf, r3.NurbsSurface) else srf.ToNurbsSurface()
+    from OCP.Geom import Geom_BSplineSurface
+    from OCP.TColgp import TColgp_Array2OfPnt
+    from OCP.TColStd import TColStd_Array2OfReal
+
+    cu, cv = ns.Points.CountU, ns.Points.CountV
+    du, dv = ns.Degree(0), ns.Degree(1)
+    ku = [ns.KnotsU[i] for i in range(len(ns.KnotsU))]
+    kv = [ns.KnotsV[i] for i in range(len(ns.KnotsV))]
+    u_distinct, u_mults = _rhino_knots_to_occ(ku)
+    v_distinct, v_mults = _rhino_knots_to_occ(kv)
+    if (sum(u_mults) != cu + du + 1 or sum(v_mults) != cv + dv + 1):
+        return None    # periodic surface; skip exact conversion
+
+    poles = TColgp_Array2OfPnt(1, cu, 1, cv)
+    weights = TColStd_Array2OfReal(1, cu, 1, cv)
+    for i in range(cu):
+        for j in range(cv):
+            cp = ns.Points.GetControlPoint(i, j)   # homogeneous coords
+            w = cp.W if cp.W > 1e-12 else 1.0
+            poles.SetValue(i + 1, j + 1,
+                           gp_Pnt(cp.X / w, cp.Y / w, cp.Z / w))
+            weights.SetValue(i + 1, j + 1, w)
+
+    def arr1(vals, integer=False):
+        a = (TColStd_Array1OfInteger if integer
+             else TColStd_Array1OfReal)(1, len(vals))
+        for i, v in enumerate(vals, start=1):
+            a.SetValue(i, int(v) if integer else float(v))
+        return a
+
+    surf = Geom_BSplineSurface(
+        poles, weights, arr1(u_distinct), arr1(v_distinct),
+        arr1(u_mults, True), arr1(v_mults, True), du, dv, False, False)
+    return BRepBuilderAPI_MakeFace(surf, 1e-6).Face()
+
+
+_MESH_CHUNK = 2048
+
+
+def _reporting(items, report, lo: float, hi: float):
+    """`items`, reporting progress across `lo`..`hi` as they go past.
+
+    Wraps the iterator instead of indexing it: rhino3dm's vertex list is nearly
+    twice as slow to index as to iterate, so the progress must not cost more
+    than it is worth. The chunk grows with the mesh, keeping the number of
+    updates bounded — reporting per face would outweigh the conversion.
+    """
+    total = len(items) or 1
+    step = max(_MESH_CHUNK, total // 64)
+    for i, item in enumerate(items):
+        if i % step == 0:
+            report(lo + (hi - lo) * i / total)
+        yield item
+
+
+def _r3_mesh_to_shape(mesh: r3.Mesh, as_mesh: bool = True, report=None):
+    """A Rhino mesh as a MeshShape (or a sewn shell).
+
+    rhino3dm exposes no bulk accessor, so vertices and faces are both read one
+    at a time in Python. The fence file's biggest mesh is 1.6 million faces —
+    21 seconds in what was a single opaque call, with a frozen bar and a dead
+    Cancel button. Vertices take roughly three times as long as faces, hence
+    the lopsided split of the progress range.
+
+    Iterate both lists; don't index them. `mesh.Faces[i]` re-resolves the
+    `.Faces` property every time round, building a fresh list wrapper per face,
+    and the vertex list is nearly twice as slow to index as to iterate. Doing
+    it this way is about a fifth quicker than the version with no progress in
+    it at all, so the bar costs nothing.
+    """
+    report = report or Progress()
+    verts = np.array([[v.X, v.Y, v.Z]
+                      for v in _reporting(mesh.Vertices, report, 0.0, 0.7)],
+                     float)
+    tris = []
+    for f in _reporting(mesh.Faces, report, 0.7, 0.95):
+        a, b, c, d = f
+        tris.append((a, b, c))
+        if d != c:
+            tris.append((a, c, d))
+    if as_mesh:
+        from ..core.mesh import MeshShape
+        # The file carries Rhino's own vertex normals, smoothed to whatever
+        # weld angle the modeller chose, and they are not read. rhino3dm hands
+        # them over one attribute at a time like everything else: 36us each,
+        # 239 seconds for the 6.6 million of one survey object, on top of the
+        # 313 the same object's vertices already cost. That is most of an
+        # import spent on shading. They are worked out from the geometry
+        # instead — see mesh_to_display, which welds by position and keeps the
+        # edges the modeller made hard.
+        return MeshShape(verts, np.asarray(tris, np.uint32))
+    return _shell_from_triangles(verts, tris)
+
+
+# -------------------------------------------------------------------- breps
+
+def _brep_edge_table(brep) -> dict:
+    """{edge index: shape} for the brep's edges.
+
+    Keyed by index rather than packed into a list because a face's trims
+    name the edges they run along by index, and an edge that fails to
+    convert must not shift the ones after it.
+    """
+    table = {}
+    for i in range(len(brep.Edges)):
+        try:
+            table[i] = _r3_curve_to_shape(brep.Edges[i].ToNurbsCurve())
+        except Exception:                                       # noqa: BLE001
+            continue
+    return table
+
+
+def _brep_edge_context(brep):
+    """(edges, boxes, table) shared by every face of one brep."""
+    table = _brep_edge_table(brep)
+    edges = [table[i] for i in sorted(table)]
+    return edges, _edge_boxes(edges), table
+
+
+def _face_from_loops(rface, surf, table: dict, vertices=None):
+    """The face trimmed by the loops the file itself carries, or None.
+
+    A loop that runs to a pole or walks a seam cannot be rebuilt from its
+    3D edges alone (issue #34), so with the brep's vertices to hand those
+    are built from their trims in the surface's own (u, v) instead. Every
+    other face keeps the path it always had.
+    """
+    if vertices is not None and _loops_need_trims(rface):
+        face = _face_from_trims(rface, surf, table, vertices)
+        if face is not None:
+            return face
+    return _face_from_edge_loops(rface, surf, table)
+
+
+def _loops_need_trims(rface) -> bool:
+    """Does a loop run to a pole or walk a seam?
+
+    A pole has no 3D edge, and the file marks its trim with edge index -1.
+    A seam is one edge a loop walks twice, once on each side of it.
+    """
+    for li in range(len(rface.Loops)):
+        loop = rface.Loops[li]
+        seen = set()
+        for ti in range(loop.TrimCount):
+            ei = loop.Trims[ti].EdgeIndex
+            if ei == -1 or ei in seen:
+                return True
+            seen.add(ei)
+    return False
+
+
+_TRIM_SAMPLES = 33
+_TRIM_FIT = 1e-5          # how far a rebuilt trim may stray from its edge
+
+
+def _face_from_trims(rface, surf, table: dict, vertices, tol=1e-6):
+    """The face built from its trims in (u, v), or None.
+
+    rhino3dm gives a face its surface, its trims in loop order, and each
+    trim's 3D edge and direction, but not the 2D trim curves the file keeps.
+    So the trims are rebuilt: each edge placed on the surface, and each
+    loop's ambiguities settled by the loop itself.
+
+    On a closed surface a point on the seam is two places in (u, v), one
+    each side. An edge whose inside lies within the surface has one place
+    only, and it anchors the loop. An edge on the seam, or one hugging it
+    beside a pole, where either side fits the 3D edge, takes whichever side
+    its anchored neighbour is on. A pole becomes an edge of no length that
+    runs along the pinched side between the trims either side of it.
+
+    Rhino writes outer loops anticlockwise in (u, v) and holes clockwise,
+    so the face so built already knows which side of its boundary it is.
+    """
+    try:
+        return _build_from_trims(rface, surf, table, vertices, tol)
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _free_parameter(surf, uv, step=1e-3) -> int:
+    """At a pole one parameter moves nothing: 0 for u, 1 for v."""
+    u, v = uv
+    u0, u1, v0, v1 = surf.Bounds()
+    here = surf.Value(u, v)
+    dv, du = (v1 - v0) * step, (u1 - u0) * step
+    along_v = here.Distance(surf.Value(u, v + dv if v + dv <= v1 else v - dv))
+    along_u = here.Distance(surf.Value(u + du if u + du <= u1 else u - du, v))
+    return 1 if along_v < along_u else 0
+
+
+def _place_trim(sas, surf, pts, closed, at_pole, tol, seed=None) -> list:
+    """(u, v) of each 3D sample of one edge, by continuity from its middle.
+
+    Where a sample lies exactly on the seam the projector ignores the hint
+    and answers one side, so it takes its neighbour's side instead; where a
+    sample sits on a pole, its free parameter comes from its neighbour, so
+    the pole's own edge spans the pinched side properly.
+    """
+    from OCP.gp import gp_Pnt2d
+    n = len(pts)
+    mid = n // 2
+    uv = [None] * n
+    q = (sas.NextValueOfUV(seed, pts[mid], tol, 1e-3) if seed is not None
+         else sas.ValueOfUV(pts[mid], tol))
+    uv[mid] = (q.X(), q.Y())
+    outward = ((range(mid + 1, n), -1), (range(mid - 1, -1, -1), 1))
+    for rng, step in outward:
+        for k in rng:
+            q = sas.NextValueOfUV(gp_Pnt2d(*uv[k + step]), pts[k], tol, 1e-3)
+            uv[k] = (q.X(), q.Y())
+    for d, lo, hi in closed:
+        half = (hi - lo) / 2
+        for rng, step in outward:
+            for k in rng:
+                here, there = uv[k][d], uv[k + step][d]
+                on_line = min(abs(here - lo), abs(here - hi)) < 1e-6 * (hi - lo) + 1e-9
+                if on_line and abs(here - there) > half:
+                    side = hi if there > lo + half else lo
+                    uv[k] = tuple(side if j == d else uv[k][j] for j in (0, 1))
+    for k, nb in ((0, 1), (n - 1, n - 2)):
+        if at_pole[k == n - 1] or sas.IsDegenerated(pts[k], tol * 10):
+            free = _free_parameter(surf, uv[k])
+            fixed = list(uv[k])
+            fixed[free] = uv[nb][free]
+            uv[k] = tuple(fixed)
+    return uv
+
+
+def _trim_placements(sas, surf, pts, closed, at_pole, walked_twice, tol) -> list:
+    """Every place this edge could lie in (u, v), first the likeliest.
+
+    One, for an edge whose inside lies within the surface. Two, one each
+    side, for an edge on the seam: judged in 3D, because beside a pole the
+    seam parameter stops meaning anything, and taken as said for an edge
+    the loop walks twice, which is a seam whatever its samples show. Two as
+    well for an edge that fits either side of the seam as closely.
+    """
+    from OCP.gp import gp_Pnt2d
+    n = len(pts)
+    base = _place_trim(sas, surf, pts, closed, at_pole, tol)
+
+    def off_line(d, lo):
+        worst = 0.0
+        for k in range(n):
+            q = list(base[k])
+            q[d] = lo
+            worst = max(worst, pts[k].Distance(surf.Value(*q)))
+        return worst
+
+    seam = [d for d, lo, hi in closed if off_line(d, lo) < 1e-6]
+    if not seam and walked_twice and closed:
+        seam = [min(closed, key=lambda c: off_line(c[0], c[1]))[0]]
+    if seam:
+        # wholly on one side or wholly on the other: the sampler flips
+        # between them along a seam, the two being one place
+        out = []
+        for d in seam:
+            lo, hi = next((c[1], c[2]) for c in closed if c[0] == d)
+            for side in (lo, hi):
+                out.append([tuple(side if j == d else p[j] for j in (0, 1))
+                            for p in base])
+        return out
+
+    def stray(uv):
+        return max(pts[k].Distance(surf.Value(*uv[k])) for k in range(1, n - 1))
+
+    fit = stray(base)
+    out = [base]
+    for d, lo, hi in closed:
+        for side in (lo, hi):
+            seed = list(base[n // 2])
+            seed[d] = side
+            alt = _place_trim(sas, surf, pts, closed, at_pole, tol, gp_Pnt2d(*seed))
+            same = any(max(abs(a[0] - b[0]) + abs(a[1] - b[1])
+                           for a, b in zip(alt, k)) < 1e-6 for k in out)
+            if not same and stray(alt) <= max(fit * 10, 1e-6):
+                out.append(alt)
+    return out
+
+
+def _settle_sides(items) -> None:
+    """Give every edge in doubt the side its settled neighbour is on.
+
+    A seam the loop walks twice lies on opposite sides on its two walks,
+    which is what walking it twice means. A loop of nothing but seams and
+    poles, a whole sphere say, has no neighbour settled to begin from, so
+    one seam is put on one side and marked as chosen rather than known;
+    `_loop_turns_rightly` swaps the choice if the loop comes out backwards.
+    """
+    n = len(items)
+    for it in items:
+        if "edge" in it:
+            it["uv"] = it["places"][0]
+            it["settled"] = len(it["places"]) == 1
+            it["chosen"] = False
+
+    def twin_of(k):
+        ei = items[k]["edge"]
+        return next((j for j, o in enumerate(items)
+                     if j != k and o.get("edge") == ei and o["settled"]), None)
+
+    todo = [k for k, it in enumerate(items) if "edge" in it and not it["settled"]]
+    while todo:
+        left = []
+        for k in todo:
+            it, before, after = items[k], items[(k - 1) % n], items[(k + 1) % n]
+            twin = twin_of(k)
+            if twin is not None:
+                other = items[twin]["uv"][len(it["uv"]) // 2]
+                it["uv"] = max(it["places"], key=lambda uv: float(
+                    np.hypot(*np.subtract(uv[len(uv) // 2], other))))
+                it["chosen"] = items[twin]["chosen"]
+            elif "edge" in before and before["settled"]:
+                want = _trim_ends(before, before["uv"])[1]
+                it["uv"] = min(it["places"], key=lambda uv: float(
+                    np.hypot(*np.subtract(_trim_ends(it, uv)[0], want))))
+            elif "edge" in after and after["settled"]:
+                want = _trim_ends(after, after["uv"])[0]
+                it["uv"] = min(it["places"], key=lambda uv: float(
+                    np.hypot(*np.subtract(_trim_ends(it, uv)[1], want))))
+            else:
+                left.append(k)
+                continue
+            it["settled"] = True
+        if len(left) == len(todo):
+            # nothing settled in reach: choose for the first, and go on
+            first = items[left[0]]
+            first["uv"], first["settled"], first["chosen"] = first["places"][0], True, True
+            left = left[1:]
+        todo = left
+    _record_ends(items)
+
+
+def _trim_ends(it, uv):
+    """(start, end) in (u, v) in the direction the loop walks the trim."""
+    return (uv[-1], uv[0]) if it["rev"] else (uv[0], uv[-1])
+
+
+def _record_ends(items) -> None:
+    for it in items:
+        if "edge" in it:
+            it["start"], it["end"] = _trim_ends(it, it["uv"])
+
+
+def _loop_turns_rightly(items, outer: bool) -> None:
+    """Rhino writes an outer loop anticlockwise in (u, v) and a hole
+    clockwise. Where the sides were chosen rather than known, and the loop
+    turns the wrong way, the choice was the other one: swap it."""
+    if not any(it.get("chosen") for it in items if "edge" in it):
+        return
+    ring = []
+    for it in items:
+        if "edge" in it:
+            uv = it["uv"][::-1] if it["rev"] else it["uv"]
+            ring.extend(uv)
+    xs, ys = np.array([p[0] for p in ring]), np.array([p[1] for p in ring])
+    signed = 0.5 * float(np.sum(xs * np.roll(ys, -1) - np.roll(xs, -1) * ys))
+    if (signed > 0) == outer:
+        return
+    for it in items:
+        if "edge" in it and it.get("chosen"):
+            other = [uv for uv in it["places"] if uv is not it["uv"]]
+            if other:
+                it["uv"] = other[0]
+    _record_ends(items)
+
+
+def _fit_trim(it, sas, surf, closed, tol, rounds=4):
+    """The trim's curve on the surface through its samples, with more
+    samples wherever it strays from the edge: an edge that skims the seam
+    swings quickly in (u, v), and too few samples overshoot across it."""
+    from OCP.Geom2dAPI import Geom2dAPI_Interpolate
+    from OCP.gp import gp_Pnt2d
+    from OCP.TColgp import TColgp_HArray1OfPnt2d
+    from OCP.TColStd import TColStd_HArray1OfReal
+    ad, ts, uv = it["curve"], list(it["ts"]), list(it["uv"])
+    curve = None
+    for _ in range(rounds + 1):
+        n = len(ts)
+        pts2 = TColgp_HArray1OfPnt2d(1, n)
+        pars = TColStd_HArray1OfReal(1, n)
+        for i in range(n):
+            pts2.SetValue(i + 1, gp_Pnt2d(*uv[i]))
+            pars.SetValue(i + 1, float(ts[i]))
+        fit = Geom2dAPI_Interpolate(pts2, pars, False, 1e-9)
+        fit.Perform()
+        if not fit.IsDone():
+            return None
+        curve = fit.Curve()
+        strays = []
+        for i in range(n - 1):
+            tm = 0.5 * (ts[i] + ts[i + 1])
+            q = curve.Value(tm)
+            if ad.Value(tm).Distance(surf.Value(q.X(), q.Y())) > _TRIM_FIT:
+                strays.append(i)
+        if not strays:
+            return curve
+        for i in reversed(strays):
+            tm = 0.5 * (ts[i] + ts[i + 1])
+            q = sas.NextValueOfUV(gp_Pnt2d(*uv[i]), ad.Value(tm), tol, 1e-3)
+            m = [q.X(), q.Y()]
+            for d, lo, hi in closed:
+                if abs(m[d] - uv[i][d]) > (hi - lo) / 2:
+                    m[d] = hi if uv[i][d] > lo + (hi - lo) / 2 else lo
+            ts.insert(i + 1, tm)
+            uv.insert(i + 1, tuple(m))
+    return curve
+
+
+def _build_from_trims(rface, surf, table, vertices, tol):
+    from OCP.BRep import BRep_Builder, BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.BRepLib import BRepLib
+    from OCP.Geom2d import Geom2d_Line, Geom2d_TrimmedCurve
+    from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+    from OCP.TopAbs import TopAbs_FORWARD, TopAbs_REVERSED
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import (TopoDS, TopoDS_Edge, TopoDS_Face,
+                            TopoDS_Vertex, TopoDS_Wire)
+    from OCP.gp import gp_Dir2d, gp_Pnt, gp_Pnt2d
+
+    sas = ShapeAnalysis_Surface(surf)
+    bb = BRep_Builder()
+    loc = TopLoc_Location()
+    u0, u1, v0, v1 = surf.Bounds()
+    closed = [c for c in ((0, u0, u1) if surf.IsUClosed() else None,
+                          (1, v0, v1) if surf.IsVClosed() else None) if c]
+    made = {}
+
+    def vertex(i):
+        if i not in made:
+            p = vertices[i].Location
+            v = TopoDS_Vertex()
+            bb.MakeVertex(v, gp_Pnt(p.X, p.Y, p.Z), tol)
+            made[i] = v
+        return made[i]
+
+    face = TopoDS_Face()
+    bb.MakeFace(face, surf, loc, tol)
+    for li in range(len(rface.Loops)):
+        loop = rface.Loops[li]
+        trims = [loop.Trims[ti] for ti in range(loop.TrimCount)]
+        # the file names its poles: every trim along one starts and ends there
+        poles = {t.StartVertexIndex for t in trims if t.EdgeIndex == -1}
+        walked = {}
+        for t in trims:
+            walked[t.EdgeIndex] = walked.get(t.EdgeIndex, 0) + 1
+        items = []
+        for t in trims:
+            if t.EdgeIndex == -1:
+                items.append({"pole": t.StartVertexIndex})
+                continue
+            src = table.get(t.EdgeIndex)
+            if src is None:
+                return None
+            ad = BRepAdaptor_Curve(TopoDS.Edge_s(src))
+            a, b = ad.FirstParameter(), ad.LastParameter()
+            ts = np.linspace(a, b, _TRIM_SAMPLES)
+            pts = [ad.Value(x) for x in ts]
+            # the edge's own start and end, whichever way the loop walks it
+            first, last = ((t.EndVertexIndex, t.StartVertexIndex) if t.IsReversed
+                           else (t.StartVertexIndex, t.EndVertexIndex))
+            items.append({
+                "edge": t.EdgeIndex, "rev": t.IsReversed, "src": src,
+                "curve": ad, "range": (a, b), "ts": ts,
+                "first": first, "last": last,
+                "places": _trim_placements(
+                    sas, surf, pts, closed, (first in poles, last in poles),
+                    walked[t.EdgeIndex] > 1, tol)})
+        _settle_sides(items)
+        _loop_turns_rightly(items, "Outer" in str(loop.LoopType))
+
+        wire = TopoDS_Wire()
+        bb.MakeWire(wire)
+        built = {}
+        n = len(items)
+        for k, it in enumerate(items):
+            if "pole" in it:
+                before = next((items[(k - j) % n] for j in range(1, n)
+                               if "edge" in items[(k - j) % n]), None)
+                after = next((items[(k + j) % n] for j in range(1, n)
+                              if "edge" in items[(k + j) % n]), None)
+                if before is None or after is None:
+                    continue
+                p, q = np.array(before["end"]), np.array(after["start"])
+                span = float(np.linalg.norm(q - p))
+                if span < 1e-12:
+                    continue
+                line = Geom2d_Line(gp_Pnt2d(*p), gp_Dir2d(*(q - p)))
+                e = TopoDS_Edge()
+                bb.MakeEdge(e)
+                bb.UpdateEdge(e, Geom2d_TrimmedCurve(line, 0.0, span), surf, loc, tol)
+                bb.Range(e, 0.0, span)
+                bb.Degenerated(e, True)
+                pole = vertex(it["pole"])
+                bb.Add(e, pole.Oriented(TopAbs_FORWARD))
+                bb.Add(e, pole.Oriented(TopAbs_REVERSED))
+                bb.Add(wire, e)
+                continue
+            curve = _fit_trim(it, sas, surf, closed, tol)
+            if curve is None:
+                return None
+            ei = it["edge"]
+            if ei not in built:
+                a, b = it["range"]
+                e = TopoDS_Edge()
+                bb.MakeEdge(e, BRep_Tool.Curve_s(TopoDS.Edge_s(it["src"]), 0.0, 0.0), tol)
+                bb.Range(e, a, b)
+                bb.Add(e, vertex(it["first"]).Oriented(TopAbs_FORWARD))
+                bb.Add(e, vertex(it["last"]).Oriented(TopAbs_REVERSED))
+                built[ei] = (e, {}, (a, b))
+            e, curves, _ = built[ei]
+            curves["R" if it["rev"] else "F"] = curve
+            bb.Add(wire, TopoDS.Edge_s(e.Reversed()) if it["rev"] else e)
+        for e, curves, (a, b) in built.values():
+            if "F" in curves and "R" in curves:
+                # a seam: one curve for each side, as OpenCascade keeps one
+                bb.UpdateEdge(e, curves["F"], curves["R"], surf, loc, tol)
+            else:
+                bb.UpdateEdge(e, next(iter(curves.values())), surf, loc, tol)
+            bb.Range(e, a, b)
+        bb.Add(face, wire)
+    BRepLib.SameParameter_s(face, tol, True)
+    area = geometry.surface_area(face)
+    if not (geometry.is_valid(face) and np.isfinite(area) and area > 0):
+        return None
+    return face
+
+
+def _face_from_edge_loops(rface, surf, table: dict):
+    """The face trimmed by the loops the file itself carries, or None.
+
+    `BrepFace.Loops` gives each boundary as trims in order, and every trim
+    names the edge it runs along and whether the loop runs backwards along
+    it. That is the trim the file meant, so there is nothing to work out:
+    no searching for edges near the face, no projecting them onto the
+    surface to see which stuck, and no splitting the untrimmed surface
+    when the guess came up short.
+
+    A seam is why the guessing could not be made to work. The loop walks
+    the seam edge twice, once each way, so the boundary is not a set of
+    distinct edges at all, and no amount of joining them end to end closes
+    it. Only the trim's own direction tells the two passes apart.
+    """
+    from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeFace,
+                                    BRepBuilderAPI_MakeWire)
+    from OCP.ShapeFix import ShapeFix_Face
+    from OCP.TopoDS import TopoDS
+
+    loops = rface.Loops
+    if loops is None or len(loops) == 0:
+        return None
+    outer = None
+    inner = []
+    for li in range(len(loops)):
+        loop = loops[li]
+        mk = BRepBuilderAPI_MakeWire()
+        for ti in range(loop.TrimCount):
+            trim = loop.Trims[ti]
+            edge = table.get(trim.EdgeIndex)
+            if edge is None:
+                return None                 # a trim we cannot follow
+            occ_edge = geometry.occ.to_edge(edge)
+            mk.Add(TopoDS.Edge_s(occ_edge.Reversed()) if trim.IsReversed
+                   else occ_edge)
+        if not mk.IsDone():
+            return None
+        wire = mk.Wire()
+        if "Outer" in str(loop.LoopType):
+            if outer is not None:
+                return None                 # two outers is not one face
+            outer = wire
+        else:
+            inner.append(wire)
+    if outer is None:
+        return None
+
+    # Which side of the boundary the surface keeps is not written down, and
+    # the wrong choice is the rest of the surface, which is valid and finite
+    # when the surface is bounded. The patch's own extent is its boundary's;
+    # the complement runs on to the surface's natural edge.
+    lo, hi = geometry.bbox(outer)
+    want = float(np.linalg.norm(np.subtract(hi, lo)))
+    best = None
+    for flip in (False, True):
+        try:
+            rim = TopoDS.Wire_s(outer.Reversed()) if flip else outer
+            mk = BRepBuilderAPI_MakeFace(surf, rim, True)
+            if not mk.IsDone():
+                continue
+            for wire in inner:
+                mk.Add(wire if flip else TopoDS.Wire_s(wire.Reversed()))
+            fix = ShapeFix_Face(geometry.occ.to_face(mk.Face()))
+            fix.Perform()
+            face = fix.Face()
+            if face is None or face.IsNull() or not geometry.is_valid(face):
+                continue
+            area = geometry.surface_area(face)
+            if not (np.isfinite(area) and area > 1e-9):
+                continue
+            flo, fhi = geometry.bbox(face)
+            off = abs(float(np.linalg.norm(np.subtract(fhi, flo))) - want)
+        except Exception:                                       # noqa: BLE001
+            continue
+        if best is None or off < best[1]:
+            best = (face, off)
+    return best[0] if best is not None else None
+
+
+def _split_face_by_edges(face, edges: list) -> list:
+    """Split an untrimmed face with on-surface edges; [] if nothing cut."""
+    from ..core.occ import BRepAlgoAPI_Splitter, TopTools_ListOfShape
+    if not edges:
+        return []
+    args = TopTools_ListOfShape()
+    args.Append(face)
+    tools = TopTools_ListOfShape()
+    for e in edges:
+        tools.Append(e)
+    sp = BRepAlgoAPI_Splitter()
+    sp.SetArguments(args)
+    sp.SetTools(tools)
+    sp.SetFuzzyValue(1e-6)
+    sp.Build()
+    if not sp.IsDone():
+        return []
+    pieces = geometry.faces_of(sp.Shape())
+    return pieces if len(pieces) > 1 else []
+
+
+def _classify_by_mesh(pieces: list, mesh_shape, tol: float) -> list:
+    """Keep split pieces whose centroid lies on the reference mesh."""
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from ..core.occ import BRepBuilderAPI_MakeVertex, gp_Pnt
+    kept = []
+    for piece in pieces:
+        try:
+            cx, cy, cz = geometry.centroid(piece)
+            v = BRepBuilderAPI_MakeVertex(gp_Pnt(cx, cy, cz)).Vertex()
+            d = BRepExtrema_DistShapeShape(v, mesh_shape)
+            if d.IsDone() and d.Value() < tol:
+                kept.append(piece)
+        except Exception:
+            continue
+    return kept
+
+
+def _group_closed_wires(edges: list) -> list:
+    """Greedily join edges end-to-end into closed wires."""
+    wires = []
+    remaining = list(edges)
+    while remaining:
+        wire = geometry.join_curves([remaining.pop(0)])
+        grown = True
+        while grown:
+            grown = False
+            for e in list(remaining):
+                try:
+                    wire = geometry.join_curves([wire, e])
+                    remaining.remove(e)
+                    grown = True
+                except geometry.GeometryError:
+                    continue
+        if geometry.is_closed_curve(wire):
+            wires.append(wire)
+    return wires
+
+
+def _shape_box(shape, tol: float = 0.0):
+    """(min, max) corners of a shape's bounding box, grown by `tol`. None if
+    the box comes back void."""
+    from OCP.Bnd import Bnd_Box
+    box = Bnd_Box()
+    try:
+        geometry.occ.bbox_add(shape, box)
+        if box.IsVoid():
+            return None
+        xn, yn, zn, xx, yx, zx = box.Get()
+    except Exception:
+        return None
+    return (np.array([xn - tol, yn - tol, zn - tol]),
+            np.array([xx + tol, yx + tol, zx + tol]))
+
+
+class _EdgeBoxes:
+    """Bounding boxes of a brep's edges, with a sorted view for containment.
+
+    Unpacks like the `(los, his)` pair it used to be. The extra machinery
+    exists because even the vectorised sweep is paid once per face: on a
+    19105-face cab the compare over 48k boxes plus rebuilding the survivor
+    list cost ~2 ms per face, 40% of converting one. `contained` instead
+    binary-searches boxes sorted by their least x — a contained box starts
+    inside the target's x-span, so only that slice is compared — and hands
+    back original-order indices so the caller's edge list stays aligned.
+    """
+
+    def __init__(self, los, his):
+        self.los = los
+        self.his = his
+        self._order = None      # built on first containment query
+
+    def __iter__(self):
+        return iter((self.los, self.his))
+
+    def __getitem__(self, i):
+        return (self.los, self.his)[i]
+
+    def contained(self, lo, hi) -> np.ndarray:
+        """Indices of boxes lying wholly inside [lo, hi], ascending.
+
+        An unmeasurable (infinite) box is never contained — same answer the
+        full sweep gave, since -inf sits below any target corner.
+        """
+        if self._order is None:
+            self._order = np.argsort(self.los[:, 0], kind="stable")
+            self._slos = self.los[self._order]
+            self._shis = self.his[self._order]
+        # A contained box has lo[0] <= slos_x and shis_x <= hi[0], and
+        # slos_x <= shis_x ties both to the target's x-span.
+        i0 = np.searchsorted(self._slos[:, 0], lo[0], "left")
+        i1 = np.searchsorted(self._slos[:, 0], hi[0], "right")
+        sub = slice(i0, i1)
+        keep = (np.all(self._slos[sub] >= lo, axis=1)
+                & np.all(self._shis[sub] <= hi, axis=1))
+        found = self._order[sub][keep]
+        found.sort()
+        return found
+
+
+def _edge_boxes(edges: list) -> _EdgeBoxes:
+    """Bounding boxes of `edges` as one (min, max) pair of (N, 3) arrays.
+
+    Arrays rather than N small boxes because the prune below runs once per
+    face: at fence scale — 7921 faces, 12688 edges — a per-edge comparison in
+    Python is a hundred million calls, which is its own hang. An edge whose
+    box can't be measured gets an infinite one, so it overlaps everything and
+    is never pruned; a prefilter may only discard what it is sure about.
+    """
+    los, his = [], []
+    for e in edges:
+        box = _shape_box(e)
+        if box is None:
+            los.append([-np.inf] * 3)
+            his.append([np.inf] * 3)
+        else:
+            los.append(box[0])
+            his.append(box[1])
+    return _EdgeBoxes(np.array(los, float).reshape(-1, 3),
+                      np.array(his, float).reshape(-1, 3))
+
+
+def _edges_near(face, edges: list, boxes, tol: float) -> list:
+    """The edges whose bounding box comes within `tol` of `face`'s.
+
+    Both ways of trimming a face — projecting edges onto its surface, and
+    splitting it with them — cost time per edge, and each runs once per face,
+    so handing them the whole brep's edge list makes import quadratic. That is
+    fatal on set-design polysurfaces: one 7921-face fence in a 921 MB file
+    meant about 1.1 billion surface projections.
+
+    Discarding by box is sound for both. An edge every sample of which
+    projects onto the surface within `tol` lies inside the surface's box grown
+    by `tol`; and an edge whose box misses the face's cannot cut it. `boxes`
+    comes from `_edge_boxes`, computed once per brep.
+    """
+    target = _shape_box(face, tol)
+    if target is None or not edges:
+        return edges                      # can't prune; test everything
+    lo, hi = target
+    los, his = boxes
+    keep = np.all((los <= hi) & (his >= lo), axis=1)
+    # Indexing the few survivors beats walking all N edges in a zip.
+    return [edges[i] for i in np.flatnonzero(keep)]
+
+
+def _edges_bounding(face, edges: list, boxes, tol: float) -> list:
+    """The edges that could be trims of `face` — box contained in its own.
+
+    Stronger than `_edges_near`, and sound for this use: a trim loop lies
+    within the surface it bounds, so an edge running past the surface's extent
+    bounds something else. On the fence that is most of them — a rail spanning
+    the run overlaps every panel's box but belongs to none.
+    """
+    target = _shape_box(face, tol)
+    if target is None or not edges:
+        return edges
+    lo, hi = target
+    return [edges[i] for i in boxes.contained(lo, hi)]
+
+
+def _edges_cutting(face, surf, edges: list, boxes, tol: float) -> list:
+    """The edges that could split `face` — reaching it, and lying on it.
+
+    `_split_face_by_edges` wants on-surface edges, but was handed the brep's
+    whole list: a single boolean against ~2900 unrelated edges took 62 seconds,
+    which across the fence is most of a working day. Looser than
+    `_edges_bounding` on purpose — an edge that overruns the surface's extent
+    is no trim of it but does still cut it.
+    """
+    return _edges_on_surface(surf, _edges_near(face, edges, boxes, tol), tol)
+
+
+def _edges_on_surface(surf, edges: list, tol: float) -> list:
+    """The subset of edges lying on `surf` (sampled projection test).
+
+    Costs a handful of projections per edge, so callers pass only the edges
+    that could bound the face — see `_edges_bounding`. The projector is built
+    once and re-aimed per sample: constructing the extrema solver is the
+    expensive part, and it depends only on the surface.
+    """
+    on = []
+    projector = None
+    for e in edges:
+        try:
+            ad = geometry.occ.edge_adaptor(geometry.occ.to_edge(e))
+        except Exception:
+            continue
+        t0, t1 = ad.FirstParameter(), ad.LastParameter()
+        hit = True
+        for i in range(6):
+            p = ad.Value(t0 + (t1 - t0) * i / 5)
+            if projector is None:
+                projector = GeomAPI_ProjectPointOnSurf(p, surf)
+            else:
+                projector.Perform(p)
+            if projector.NbPoints() == 0 or projector.LowerDistance() > tol:
+                hit = False
+                break
+        if hit:
+            on.append(e)
+    return on
+
+
+def _trimmed_face(surf, edges: list):
+    """Build an exactly trimmed face from a surface and its boundary edges.
+
+    Rhino .3dm keeps 2D trim pcurves, but rhino3dm does not expose them, so
+    the loops are rebuilt from the brep's 3D edges and OCCT projects them
+    back onto the surface. Periodic surfaces (cylinders/cones) treat extra
+    loops as further boundaries; bounded surfaces treat them as holes.
+    """
+    import numpy as np
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.GeomAdaptor import GeomAdaptor_Surface
+    from OCP.ShapeFix import ShapeFix_Face
+
+    wires = _group_closed_wires(edges)
+    if not wires:
+        return None
+    try:
+        ga = GeomAdaptor_Surface(surf)
+        periodic = ga.IsUPeriodic() or ga.IsVPeriodic()
+
+        def diag(w):
+            (mn, mx) = geometry.bbox(w)
+            return float(np.linalg.norm(np.subtract(mx, mn)))
+
+        wires.sort(key=diag, reverse=True)
+
+        def attempt(flip_outer):
+            outer = geometry.occ.to_wire(geometry.to_wire(wires[0]))
+            if flip_outer:
+                outer = geometry.occ.to_wire(outer.Reversed())
+            mk = BRepBuilderAPI_MakeFace(surf, outer, True)
+            if not mk.IsDone():
+                return None
+            # On a bounded surface the extra loops are holes and run
+            # opposite the outer; on a periodic surface they are further
+            # boundary loops of the band and keep their orientation.
+            for w in wires[1:]:
+                wire = geometry.occ.to_wire(geometry.to_wire(w))
+                if not periodic:
+                    wire = geometry.occ.to_wire(wire.Reversed())
+                if flip_outer:
+                    wire = geometry.occ.to_wire(wire.Reversed())
+                mk.Add(wire)
+            fix = ShapeFix_Face(geometry.occ.to_face(mk.Face()))
+            fix.Perform()
+            face = fix.Face()
+            if face is None or face.IsNull() or not geometry.is_valid(face):
+                return None
+            area = geometry.surface_area(face)
+            if not np.isfinite(area) or area <= 1e-9:
+                return None
+            return face
+
+        # The loop's winding relative to the surface UV is unknown, so the
+        # trimmed region may come out as the infinite complement (reversed
+        # normal, invalid). Retry with the outer boundary reversed.
+        return attempt(False) or attempt(True)
+    except Exception:
+        return None
+
+
+def _face_shapes(brep, fi: int, occ_edges: list, edge_boxes,
+                 edge_table: dict | None = None) -> list:
+    """One face of a Rhino brep as [shapes] — exactly trimmed when the trim
+    can be rebuilt, its render mesh when it cannot.
+
+    The loop body of `_import_brep`, split out so the parallel importer can
+    convert a face range with a shared edge table: a 19105-face unioned
+    polysurface is otherwise one worker's problem for two minutes while the
+    rest of the pool watches (GitHub #5).
+    """
+    from OCP.BRep import BRep_Tool
+    rface = brep.Faces[fi]
+    try:
+        face = _r3_surface_to_face(rface.ToNurbsSurface())
+    except Exception:
+        face = None
+    if face is None:
+        mesh = _face_mesh_shape(rface)
+        return [mesh] if mesh is not None else []
+
+    (mn, mx) = geometry.bbox(face)
+    span = float(np.linalg.norm(np.subtract(mx, mn)))
+    tol = max(span * 0.02, 1e-4)
+
+    # Only edges that can reach this face can bound or cut it, and both
+    # ways of trimming below cost time per edge. Prune once, use twice.
+    etol = max(span * 1e-4, 1e-6)
+
+    surf = BRep_Tool.Surface_s(geometry.occ.to_face(face))
+
+    # Best path: the trim the file already describes. Everything below it
+    # is here for the faces whose loops cannot be followed.
+    if edge_table:
+        from_loops = _face_from_loops(brep.Faces[fi], surf, edge_table,
+                                      brep.Vertices)
+        if from_loops is not None:
+            return [from_loops]
+
+    # Next best: rebuild the exact trim from the brep's 3D edges
+    # that lie on this face's surface. Works with no render mesh and
+    # for any face count, unlike the split-and-classify fallback.
+    boundary = _edges_on_surface(
+        surf, _edges_bounding(face, occ_edges, edge_boxes, etol), etol)
+    exact = _trimmed_face(surf, boundary) if boundary else None
+    if exact is not None:
+        return [exact]
+
+    pieces = _split_face_by_edges(
+        face, _edges_cutting(face, surf, occ_edges, edge_boxes, etol))
+    if not pieces:
+        return [face]
+    # trimmed face: resolve which pieces are real
+    resolved = None
+    mesh = _face_mesh_shape(rface)
+    if mesh is not None:
+        kept = _classify_by_mesh(pieces, mesh, tol)
+        if kept:
+            resolved = kept
+    if resolved is None:
+        resolved = [mesh] if mesh is not None else [face]
+    return resolved
+
+
+def _import_brep(brep, report=None) -> list:
+    """Faces of a Rhino brep as OCC faces, recovering trims when possible."""
+    report = report or Progress()
+    occ_edges, edge_boxes, edge_table = _brep_edge_context(brep)
+    faces = []
+    total = len(brep.Faces)
+    # A handful of faces goes by too fast to read; naming them just makes the
+    # label flicker. On a polysurface that *is* the import, it's the only sign
+    # anything is happening.
+    detail = total >= 25
+    for fi in range(total):
+        # per face, not per object: one polysurface can be the whole import
+        report(fi / total,
+               f"{report.label} — face {fi + 1} of {total}" if detail else "")
+        faces.extend(_face_shapes(brep, fi, occ_edges, edge_boxes,
+                                  edge_table))
+
+    return _assemble_faces(faces)
+
+
+def _assemble_faces(faces) -> list:
+    """Turn one brep's converted faces into scene shapes.
+
+    A face that can't be rebuilt exactly falls back to its render mesh, and a
+    MeshShape is not a TopoDS_Shape — OCC won't sew one or even put it in a
+    compound. So keep the two apart rather than letting a single unconvertible
+    face crash the whole brep: sew the real faces, and return the mesh
+    fallbacks beside them as one mesh object (a brep is one Rhino object)."""
+    from ..core.mesh import MeshShape, merge
+    faces = [f for f in faces if f is not None and not f.IsNull()]
+    meshes = [f for f in faces if isinstance(f, MeshShape)]
+    brep_faces = [f for f in faces if not isinstance(f, MeshShape)]
+
+    out = []
+    if len(brep_faces) == 1:
+        # a face can close on itself, a sphere's round its seam and poles,
+        # and that is a solid as surely as a sewn shell is (#34)
+        from OCP.BRep import BRep_Builder
+        from OCP.TopoDS import TopoDS_Shell
+        shell = TopoDS_Shell()
+        builder = BRep_Builder()
+        builder.MakeShell(shell)
+        builder.Add(shell, brep_faces[0])
+        solid = _shell_to_solid(shell)
+        out.append(solid if geometry.shape_kind(solid) == "solid"
+                   else brep_faces[0])
+    elif brep_faces:
+        from ..core.occ import BRepBuilderAPI_Sewing
+        import numpy as np
+        # sew tolerance scaled to model size: NURBS-approximated shared edges
+        # rarely match to 1e-6, which would leave watertight shells open
+        box = geometry.make_compound(brep_faces)
+        (mn, mx) = geometry.bbox(box)
+        span = float(np.linalg.norm(np.subtract(mx, mn)))
+        sew = BRepBuilderAPI_Sewing(max(span * 1e-5, 1e-6))
+        for f in brep_faces:
+            sew.Add(f)
+        sew.Perform()
+        out.append(_shell_to_solid(sew.SewedShape()))
+    if meshes:
+        out.append(meshes[0] if len(meshes) == 1 else merge(meshes))
+    return out
+
+
+def _shell_to_solid(shape):
+    """Promote a closed shell to a solid; return `shape` unchanged if open
+    or already a solid.
+
+    The solid is turned the right way out before it is handed back. Faces
+    are rebuilt one at a time and each is oriented on its own evidence, so
+    a whole sewn shell can come out consistently inside in, and OpenCascade
+    reports that as a negative volume. It showed up in Properties as
+    `Volume: -0.041 mm³`, but outward is also what booleans, offsets and
+    shading read to tell inside from outside, so it is not only a display
+    fault. 58 of the 61 solids in one openNURBS sample arrived inverted.
+    """
+    if shape is None or shape.IsNull():
+        return shape
+    if shape.ShapeType() == geometry.occ.SHELL:
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+        from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+        from OCP.TopAbs import TopAbs_State
+        from OCP.TopoDS import TopoDS
+        shell = geometry.occ.to_shell(shape)
+        # measured, not read off the shell's flag: sewing does not always
+        # set it, and a watertight import then stayed open (#34)
+        from OCP.BRep import BRep_Tool
+        if BRep_Tool.IsClosed_s(shell):
+            try:
+                mk = BRepBuilderAPI_MakeSolid(shell)
+                if mk.IsDone():
+                    solid = mk.Solid()
+                    # A point infinitely far away is outside anything. When
+                    # the solid says it is inside, the solid is inside out.
+                    # Cheaper than integrating the volume to find out, which
+                    # on a real NURBS solid costs a few hundred milliseconds.
+                    where = BRepClass3d_SolidClassifier(solid)
+                    where.PerformInfinitePoint(1e-7)
+                    if where.State() == TopAbs_State.TopAbs_IN:
+                        solid = TopoDS.Solid_s(solid.Reversed())
+                    if geometry.is_valid(solid):
+                        return solid
+            except Exception:
+                pass
+    return shape
+
+
+def _face_mesh_shape(rface):
+    """The face's render mesh as a sewn OCC shell (None if absent)."""
+    try:
+        mesh = rface.GetMesh(r3.MeshType.Any)
+        if mesh is None or len(mesh.Vertices) == 0:
+            return None
+        return _r3_mesh_to_shape(mesh)
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------------- import
+
+def _worth_parallelising(path: str) -> bool:
+    """Spawning a reader costs a couple of seconds; a small file does not."""
+    if worker_count() < 2 or _spawn_executable() is None:
+        return False
+    try:
+        return os.path.getsize(path) >= MIN_PARALLEL_BYTES
+    except OSError:
+        return False
+
+
+# What the appearance of one layer amounts to, and all a reader needs to
+# make it: everything in a row bar the working out about the branch.
+_APPEARANCE = ("name", "path", "color", "visible", "locked", "print_width")
+
+
+def read_layers(model) -> dict:
+    """{layer index: {name, path, color, material, visible, locked, chain}} —
+    plain data, so it can cross a pipe.
+
+    Visible and Locked ride along because a working Rhino file keeps its
+    reference and construction layers switched off; ignoring the flags put
+    everything on show (GitHub #5). They are each layer's *own* switch,
+    not the one it is currently showing: Rhino switches a parent off by
+    switching its children off with it and keeps what each layer would be
+    on its own, and it is that which has to come back, or switching the
+    parent on again leaves its children off.
+
+    `path` is what the file really calls a layer, "Walls::Interior", and
+    `chain` is that path as appearances, the top of the branch first and
+    the layer itself last. A name on its own cannot say which layer is
+    meant, because two branches may each hold an Interior (#6), and the
+    chain is what lets a reader make a parent that carries no objects of
+    its own and so would never otherwise be mentioned.
+    """
+    layers = {}
+    index_of = {}
+    parent_of = {}
+    for i in range(len(model.Layers)):
+        layer = model.Layers[i]
+        c = layer.Color
+        layers[layer.Index] = {
+            "name": layer.Name,
+            "color": (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0),
+            "material": layer.RenderMaterialIndex,
+            "visible": bool(layer.GetPersistentVisibility()),
+            "locked": bool(layer.GetPersistentLocking()),
+            # Rhino's PlotWeight is mm; 0 is the device default and a negative
+            # is a pen that does not plot, neither of which we carry, so both
+            # land on our own default of 0.
+            "print_width": max(0.0, float(layer.PlotWeight)),
+        }
+        index_of[str(layer.Id)] = layer.Index
+        parent_of[layer.Index] = str(layer.ParentLayerId)
+
+    branches = {}
+    for index in layers:
+        branch = [index]
+        up = index_of.get(parent_of[index])
+        # `not in branch` rather than trusting the file: a parent chain
+        # that comes round on itself would hang the read, and a short
+        # answer is a better one than none.
+        while up is not None and up not in branch:
+            branch.append(up)
+            up = index_of.get(parent_of[up])
+        branch.reverse()
+        branches[index] = branch
+        layers[index]["path"] = PATH_SEPARATOR.join(
+            layers[i]["name"] for i in branch)
+    for index, branch in branches.items():
+        layers[index]["chain"] = tuple(
+            {k: layers[i][k] for k in _APPEARANCE} for i in branch)
+    return layers
+
+
+def read_materials(model) -> dict:
+    """{material index: {color, opacity, roughness, metallic}}.
+
+    Rendered mode has always read opacity, gloss and metal off an object's
+    material; no import ever gave it one, so a file that carries its colour on
+    its materials — which is how you would colour anything meant to be
+    rendered — arrived with every object the colour of its layer (#4).
+
+    Plain data, like the layers, so it can cross the pipe once instead of
+    riding along with every object that uses it.
+    """
+    materials = {}
+    for i in range(len(model.Materials)):
+        mat = model.Materials[i]
+        c = mat.DiffuseColor
+        materials[i] = {
+            "color": (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0),
+            "opacity": 1.0 - _clamp(mat.Transparency),
+            # Rhino's shine runs to 255 and means the opposite of roughness.
+            "roughness": 1.0 - _clamp(mat.Shine / MAX_SHINE),
+            "metallic": _clamp(mat.Reflectivity),
+        }
+    return materials
+
+
+def _clamp(value: float) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def object_appearance(attrs, layers: dict, materials: dict,
+                      parent: dict | None = None) -> dict:
+    """How one object should look: {layer, layer_color, color, material}.
+
+    `color` is an override and is None when the layer decides, which is the
+    common case and keeps a drawing's objects following their layer the way
+    they do in Rhino. Shared with the parallel importer, which resolves this
+    in the worker: the two paths disagreeing would be worse than either being
+    wrong.
+
+    `parent` is the appearance of the block instance this object was placed
+    by, if any. Inside a block a member can say its colour comes from its
+    parent, which is how one definition gets placed in several colours; with
+    no parent to ask, that source used to read as "no override" and the
+    instance's colour was thrown away.
+    """
+    layer = layers.get(attrs.LayerIndex, {})
+    index = attrs.MaterialIndex \
+        if int(attrs.MaterialSource) == _MATERIAL_FROM_OBJECT \
+        else layer.get("material", -1)
+    material = materials.get(index)
+
+    source = int(attrs.ColorSource)
+    color = None
+    if source == _COLOR_FROM_OBJECT:
+        c = attrs.ObjectColor
+        color = (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
+    elif source == _COLOR_FROM_MATERIAL and material is not None:
+        color = material["color"]
+    elif source == _COLOR_FROM_PARENT and parent is not None:
+        # the instance's own colour, or its layer's if it has none — either
+        # way the member follows the instance and not its own layer
+        color = parent["color"] or parent["layer_color"]
+
+    # A member of a hidden instance is hidden with it, however the member's
+    # own flag reads inside the definition.
+    visible = bool(attrs.Visible)
+    if parent is not None:
+        visible = visible and parent.get("visible", True)
+
+    return {"layer": layer.get("name"), "layer_color": layer.get("color"),
+            # The branch the layer sits in, so a reader can make the whole
+            # of it. Two layers may share a name (#6); only the path says
+            # which one an object is on.
+            "layer_chain": layer.get("chain", ()),
+            "layer_visible": layer.get("visible", True),
+            "layer_locked": layer.get("locked", False),
+            "layer_print_width": layer.get("print_width", 0.0),
+            "color": color, "material": _shading(material),
+            "visible": visible}
+
+
+def _shading(material: dict | None) -> dict | None:
+    """The part of a material the viewport can actually draw.
+
+    Colour included: an object whose colour source is its layer can still have
+    a material, and Rendered mode is meant to show the material's colour while
+    shaded mode shows the layer's. That is the ordinary way to set a drawing up
+    for rendering, and it was the half of #4 that reading `attrs.ColorSource`
+    alone never reached.
+    """
+    if material is None:
+        return None
+    return {k: material[k]
+            for k in ("color", "opacity", "roughness", "metallic")}
+
+
+# A definition that contains itself would otherwise place forever. Rhino will
+# not let you build one, but a file can arrive with one in it.
+MAX_BLOCK_DEPTH = 16
+
+
+def read_blocks(model) -> dict:
+    """{definition id: {"name", "members": [(geometry, attributes), ...]}}.
+
+    Read once per file, like the layer and material tables: a drawing has a
+    handful of definitions and can have thousands of instances of them.
+    """
+    blocks = {}
+    for idef in model.InstanceDefinitions:
+        members = []
+        for member_id in idef.GetObjectIds():
+            obj = model.Objects.FindId(member_id)
+            if obj is not None:
+                members.append((obj.Geometry, obj.Attributes))
+        blocks[str(idef.Id)] = {"name": (idef.Name or "").strip(),
+                                "members": members}
+    return blocks
+
+
+def _xform_matrix(xform):
+    """A rhino3dm Transform as a 4x4 numpy matrix."""
+    return np.array(
+        [[xform.M00, xform.M01, xform.M02, xform.M03],
+         [xform.M10, xform.M11, xform.M12, xform.M13],
+         [xform.M20, xform.M21, xform.M22, xform.M23],
+         [xform.M30, xform.M31, xform.M32, xform.M33]], float)
+
+
+def flatten_instance(geo, blocks: dict, depth: int = 0) -> list:
+    """An instance as [(member geometry, member attributes, 4x4)].
+
+    Serpentine3D has no block object of its own, so an instance comes in as
+    its content moved into place — the same trade Rhino's Explode makes. A
+    definition can hold instances of other definitions, and each level's
+    transform applies to everything below it, so this walks down composing
+    them.
+    """
+    if depth >= MAX_BLOCK_DEPTH:
+        return []
+    here = _xform_matrix(geo.Xform)
+    definition = blocks.get(str(geo.ParentIdefId)) or {}
+    out = []
+    for member_geo, member_attrs in definition.get("members", ()):
+        if isinstance(member_geo, r3.InstanceReference):
+            for inner_geo, inner_attrs, inner in flatten_instance(
+                    member_geo, blocks, depth + 1):
+                out.append((inner_geo, inner_attrs, here @ inner))
+        else:
+            out.append((member_geo, member_attrs, here))
+    return out
+
+
+def placed_block_name(attrs, geo, blocks: dict, index: int) -> str:
+    """What a placed block is called before its parts are named.
+
+    An unnamed instance falls back to its definition's name rather than to a
+    running count of what has been imported so far: the parallel importer
+    sees the file in strided pieces across several processes and has no such
+    count to keep, and the two paths naming the same object differently
+    would be worse than either name being poor.
+    """
+    definition = blocks.get(str(geo.ParentIdefId)) or {}
+    return (attrs.Name or definition.get("name")
+            or f"3dm block {index + 1:02d}")
+
+
+def _part_name(instance_name: str, member_attrs, index: int,
+               total: int) -> str:
+    """What one piece of a placed block is called in the object list.
+
+    A block is one object in Rhino and several here, so the pieces are named
+    after the instance that placed them or they cannot be found again.
+    """
+    if total == 1:
+        return instance_name
+    member = (member_attrs.Name or "").strip()
+    return f"{instance_name}: {member or f'part {index + 1}'}"
+
+
+def instance_to_objects(geo, instance_name: str, instance_meta: dict,
+                        blocks: dict, layers: dict, materials: dict,
+                        report=None) -> list:
+    """One placed block as the [(name, shape, meta)] it brings with it."""
+    step = report or Progress()
+    parts = flatten_instance(geo, blocks)
+    out = []
+    for index, (member_geo, member_attrs, matrix) in enumerate(parts):
+        meta = object_appearance(member_attrs, layers, materials,
+                                 parent=instance_meta)
+        name = _part_name(instance_name, member_attrs, index, len(parts))
+        for shape in object_to_shapes(member_geo, step):
+            if shape is None or shape.IsNull():
+                continue
+            try:
+                placed = geometry.apply_matrix(shape, matrix)
+            except Exception:                               # noqa: BLE001
+                # A transform OCCT will not perform is better skipped than
+                # allowed to put the piece in the wrong place.
+                continue
+            out.append((name, placed, meta))
+    return out
+
+
+def object_to_shapes(geo, report=None) -> list:
+    """The shapes one .3dm object converts to, by geometry type.
+
+    Split out of the import loop so the parallel importer converts objects by
+    exactly the same rules — the two paths disagreeing would be worse than
+    either being wrong.
+    """
+    step = report or Progress()
+    shapes = []
+    if isinstance(geo, r3.Point):
+        # A point is an object in Rhino and an object here, so it has to
+        # convert to something. With no branch at all it converted to
+        # nothing, which dropped a visible point in silence and left a
+        # hidden one as a promise that could never be kept (#10).
+        try:
+            loc = geo.Location
+            return [geometry.make_point((loc.X, loc.Y, loc.Z))]
+        except Exception:                                       # noqa: BLE001
+            return []
+    if isinstance(geo, r3.Curve):
+        try:
+            shapes = [_r3_curve_to_shape(geo)]
+        except Exception:
+            shapes = []
+    elif isinstance(geo, r3.Extrusion):
+        brep = geo.ToBrep(True)
+        if brep:
+            geo = brep
+    if isinstance(geo, r3.Brep):
+        shapes = _import_brep(geo, step)
+    elif isinstance(geo, (r3.NurbsSurface, r3.Surface)) \
+            and not isinstance(geo, r3.Brep):
+        try:
+            face = _r3_surface_to_face(geo)
+            shapes = [face] if face is not None else []
+        except Exception:
+            shapes = []
+    elif isinstance(geo, r3.Mesh):
+        shape = _r3_mesh_to_shape(geo, report=step)
+        shapes = [shape] if shape is not None else []
+    return shapes
+
+
+# --------------------------------------------------- what to put off doing
+
+def worth_deferring(geo, meta: dict) -> bool:
+    """Whether this object can be read now and converted later (#5).
+
+    A working drawing keeps its reference and survey layers switched off,
+    and converting them costs a quarter of the import while drawing none
+    of it. So anything the file says is out of sight is left as a promise.
+
+    Block instances are not, however hidden they are. One instance is as
+    many objects as its definition has members, and a placeholder that
+    turns into an unknown number of objects is a harder thing to own than
+    the saving is worth.
+    """
+    if isinstance(geo, r3.InstanceReference):
+        return False
+    return not meta.get("layer_visible", True) or not meta.get("visible", True)
+
+
+def file_kind(geo) -> str:
+    """What the file says this object is, in the scene's vocabulary.
+
+    A guess, and knowingly so: whether a brep closes into a solid is a
+    question the geometry answers and this is the answer that avoids
+    asking it. `Scene.realise` corrects it once the shape exists.
+    """
+    if isinstance(geo, (r3.Brep, r3.Extrusion)):
+        try:
+            return "solid" if geo.IsSolid else "surface"
+        except Exception:                                       # noqa: BLE001
+            return "surface"
+    if isinstance(geo, r3.Mesh):
+        return "mesh"
+    if isinstance(geo, r3.Point):
+        return "point"
+    return "curve"
+
+
+class PendingFile:
+    """A .3dm reopened for the objects an import chose not to convert.
+
+    The pool converts in other processes and cannot send back geometry it
+    never converted, so its placeholders hold an object index and this,
+    which reads the file the first time one of them is asked.
+
+    The model is dropped as soon as the last object it owed has been
+    converted, so ticking a hidden layer on costs the file being read once
+    and then nothing. An object deferred and then deleted never asks, so a
+    drawing that is closed with some of it still owed holds the model until
+    the scene goes; that is the same memory the eager import held all along.
+    """
+
+    def __init__(self, path: str, owed: int):
+        self.path = path
+        self._owed = owed
+        self._model = None
+        self._lock = threading.Lock()
+
+    def geometry(self, index: int):
+        """The object at `index`, reading the file if this is the first ask.
+
+        The geometry outlives the model it came from, so it is taken under
+        the lock and converted outside it: two layers switched on together
+        should not queue behind each other's conversion.
+        """
+        with self._lock:
+            if self._model is None:
+                self._model = r3.File3dm.Read(self.path)
+                if self._model is None:
+                    return None
+            geo = self._model.Objects[index].Geometry
+            self._owed -= 1
+            if self._owed <= 0:
+                self._model = None      # the last one; let the file go
+        return geo
+
+
+def _deferred_from_file(pending: PendingFile, index: int, kind: str):
+    def build():
+        geo = pending.geometry(index)
+        return [] if geo is None else object_to_shapes(geo)
+
+    return DeferredShape(build, kind=kind)
+
+
+def import_3dm(path: str, progress=None) -> list[tuple[str, object, dict]]:
+    """Returns [(name, shape, {layer, color})].
+
+    A shape is either geometry or, for an object the file keeps out of
+    sight, a `DeferredShape` that will convert it if anything asks.
+    """
+    report = progress or Progress()
+    if _worth_parallelising(path):
+        try:
+            return import_3dm_parallel(path, report)
+        except Cancelled:
+            raise
+        except Exception as exc:                                # noqa: BLE001
+            # Starting processes can fail in ways opening a file should not
+            # (a frozen build, a locked-down sandbox). Slow beats refusing.
+            print(f"parallel import unavailable ({exc}); "
+                  f"converting in one process", file=sys.stderr)
+
+    report(0.0, f"Reading {os.path.basename(path)}…")
+    model = r3.File3dm.Read(path)
+    if model is None:
+        raise IOError(f"Could not read 3dm file: {path}")
+
+    layers = read_layers(model)
+    materials = read_materials(model)
+    blocks = read_blocks(model)
+
+    out = []
+    counter = 0
+    total = len(model.Objects) or 1
+    for index, obj in enumerate(model.Objects):
+        # Reading the file is a fraction of the work; converting is the rest,
+        # so the bar covers the object loop and each object owns a slice of it.
+        step = report.part(index / total, (index + 1) / total,
+                           f"Converting object {index + 1} of {total}")
+        step(0.0)
+        attrs = obj.Attributes
+        if attrs.IsInstanceDefinitionObject:
+            # A definition's content is not in the drawing; only the
+            # instances that place it are. Importing it too put a ghost copy
+            # of every block at the origin.
+            continue
+        meta = object_appearance(attrs, layers, materials)
+        if isinstance(obj.Geometry, r3.InstanceReference):
+            name = placed_block_name(attrs, obj.Geometry, blocks, index)
+            for part in instance_to_objects(obj.Geometry, name, meta, blocks,
+                                            layers, materials, step):
+                counter += 1
+                out.append(part)
+            continue
+        geo = obj.Geometry
+        if worth_deferring(geo, meta):
+            # Held by the geometry rather than the model: rhino3dm hands
+            # out an object that outlives the file it was read from, so
+            # putting one aside does not keep the whole drawing open.
+            counter += 1
+            name = attrs.Name or f"3dm object {counter:02d}"
+            out.append((name, DeferredShape(
+                lambda g=geo: object_to_shapes(g), kind=file_kind(geo)), meta))
+            continue
+        for shape in object_to_shapes(geo, step):
+            if shape is None or shape.IsNull():
+                continue
+            counter += 1
+            name = attrs.Name or f"3dm object {counter:02d}"
+            out.append((name, shape, meta))
+    return out
+
+
+# ------------------------------------------------------------------- export
+
+def _write_material(model, seen: dict, material: dict) -> int:
+    """Add a material to the file, or reuse one already written.
+
+    A drawing has a few materials and thousands of objects using them, so
+    identical ones are shared rather than written out per object.
+    """
+    color = material.get("color") or (0.5, 0.5, 0.5)
+    key = (tuple(color), material.get("opacity", 1.0),
+           material.get("roughness", 0.55), material.get("metallic", 0.0))
+    if key in seen:
+        return seen[key]
+
+    mat = r3.Material()
+    mat.DiffuseColor = (int(color[0] * 255), int(color[1] * 255),
+                        int(color[2] * 255), 255)
+    mat.Transparency = 1.0 - _clamp(key[1])
+    mat.Shine = (1.0 - _clamp(key[2])) * MAX_SHINE
+    mat.Reflectivity = _clamp(key[3])
+    seen[key] = model.Materials.Add(mat)
+    return seen[key]
+
+
+def _parents_first(layers) -> list:
+    """The layers, every parent ahead of the children under it.
+
+    Layers come back in the order they were made, and moving one under a
+    layer made after it does not change that. Writing a child first would
+    leave it pointing at a parent that has no guid yet, and the branch
+    would come out flat.
+    """
+    out, seen = [], set()
+    for layer in layers.all():
+        for la in [*reversed(layers.ancestors(layer.id)), layer]:
+            if la.id not in seen:
+                seen.add(la.id)
+                out.append(la)
+    return out
+
+
+def export_3dm(scene, path: str, only_ids: list | None = None,
+               version: int = 8):
+    model = r3.File3dm()
+    layer_index = {}
+    layer_guid = {}
+    for layer in _parents_first(scene.layers):
+        rl = r3.Layer()
+        rl.Name = layer.name
+        rl.Color = (int(layer.color[0] * 255), int(layer.color[1] * 255),
+                    int(layer.color[2] * 255), 255)
+        # The layer's own switch, and the one it is showing with its
+        # parents counted. Rhino reads Visible as the second and keeps the
+        # first on the side, which is how switching a parent back on knows
+        # what to leave off.
+        rl.Visible = bool(scene.layers.is_visible(layer.id))
+        rl.SetPersistentVisibility(bool(layer.visible))
+        rl.Locked = bool(scene.layers.is_locked(layer.id))
+        rl.SetPersistentLocking(bool(layer.locked))
+        rl.PlotWeight = float(layer.print_width)   # mm; 0 = device default
+        if layer.parent in layer_guid:
+            rl.ParentLayerId = layer_guid[layer.parent]
+        idx = model.Layers.Add(rl)
+        layer_index[layer.id] = idx
+        # Add is what gives a layer its guid, and a child needs its
+        # parent's, which is why the parents go in first.
+        layer_guid[layer.id] = model.Layers[idx].Id
+
+    objs = scene.all()
+    if only_ids:
+        objs = [o for o in objs if o.id in only_ids]
+    materials = {}
+    for obj in objs:
+        attrs = r3.ObjectAttributes()
+        attrs.Name = obj.name
+        attrs.LayerIndex = layer_index.get(obj.layer_id, 0)
+        # Hidden goes with the object: a file saved mid-work should open
+        # elsewhere looking the way it was left (GitHub #5).
+        attrs.Visible = bool(obj.visible)
+        # An object that overrides its layer has to say so, or opening a file
+        # and saving it flattens every object onto its layer's colour.
+        if obj.color is not None:
+            attrs.ObjectColor = (int(obj.color[0] * 255),
+                                 int(obj.color[1] * 255),
+                                 int(obj.color[2] * 255), 255)
+            attrs.ColorSource = r3.ObjectColorSource.ColorFromObject
+        if obj.material:
+            attrs.MaterialIndex = _write_material(model, materials,
+                                                  obj.material)
+            attrs.MaterialSource = r3.ObjectMaterialSource.MaterialFromObject
+        # rhino3dm cannot write a hatch, so a line hatch leaves as the
+        # curves it is drawn with rather than as a mesh with no faces,
+        # which is nothing; a solid one leaves as its filled mesh (#33)
+        if obj.kind == "curve" or (obj.kind == "hatch"
+                                   and obj.shape.pattern != "solid"):
+            exported = False
+            for edge in geometry.edges_of(obj.shape):
+                nc = _shape_to_r3_curve(edge)
+                if nc is not None:
+                    model.Objects.AddCurve(nc, attrs)
+                    exported = True
+            if exported:
+                continue
+        mesh = tessellate(obj.shape)
+        if not mesh.has_faces:
+            continue
+        rm = r3.Mesh()
+        for v in mesh.vertices:
+            rm.Vertices.Add(float(v[0]), float(v[1]), float(v[2]))
+        for t in mesh.triangles:
+            rm.Faces.AddFace(int(t[0]), int(t[1]), int(t[2]))
+        rm.Normals.ComputeNormals()
+        model.Objects.AddMesh(rm, attrs)
+
+    if not model.Write(path, int(version)):
+        raise IOError(f"Could not write 3dm file: {path}")

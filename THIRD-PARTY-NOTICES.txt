@@ -1,0 +1,23 @@
+Vendored geometry code is from Serpentine3D, copyright 2026 Chisomo Banzi,
+MIT license. See vendor/Serpentine3D-LICENSE.txt for the full license.
+Source: https://github.com/chisomobanzi/Serpentine3D
+Pinned commit: 71045f7d06eeb4cd45a150af255c6d2c72121106
+An import dependency subset is retained unchanged under vendor/serpentine3d.
+
+Installed and bundled dependencies have their own licenses:
+rhino3dm / openNURBS: MIT; https://github.com/mcneel/rhino3dm
+cadquery-ocp-novtk / OCP: Apache-2.0 bindings; https://github.com/CadQuery/OCP
+Open Cascade Technology: LGPL-2.1 with exception;
+https://dev.opencascade.org/resources/licensing
+NumPy: BSD-3-Clause; https://numpy.org/doc/stable/license.html
+cryptography: Apache-2.0 OR BSD-3-Clause; https://github.com/pyca/cryptography
+CFFI: MIT; https://cffi.readthedocs.io/
+pycparser: BSD-3-Clause; https://github.com/eliben/pycparser
+Python: PSF; https://docs.python.org/3/license.html
+Tcl/Tk: Tcl/Tk license; https://www.tcl.tk/software/tcltk/license.html
+PyInstaller build tool: GPL with bootloader exception;
+https://pyinstaller.org/en/stable/license.html
+
+The engine packages include their upstream license files. Distribute the full
+generated app folder, including all metadata and license files in _internal.
+The source package does not bundle the installed engine binaries.
