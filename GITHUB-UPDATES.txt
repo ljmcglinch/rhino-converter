@@ -6,7 +6,7 @@ Public-key-only setup (recommended when a signing key is managed elsewhere):
 This writes only public configuration and does not read or create a private key.
 Use the real repository and a base64-encoded 32-byte Ed25519 public key.
 Then run before tagging:
-  python release_tools.py validate --repository OWNER/REPOSITORY --tag v0.5.3
+  python release_tools.py validate --repository OWNER/REPOSITORY --tag v0.6.0
 The preflight rejects invalid keys, repository mismatches and version mismatches.
 Changing an already pinned key or repository requires a migration plan.
 The configure command below is an optional publisher key-generation workflow;
@@ -31,7 +31,7 @@ do not run it when you only intend to prepare public configuration.
    including .github, update-config.json and VERSION.txt. Exclude .venv, build,
    dist, private keys, and office models. The supplied .gitignore covers common
    build outputs and private-key extensions.
-6. Push a version tag matching VERSION.txt, currently v0.5.3. GitHub Actions
+6. Push a version tag matching VERSION.txt, currently v0.6.0. GitHub Actions
    builds Windows setup plus Apple Silicon/Intel Mac packages, runs checks,
    and pauses at the protected release environment. After approval it signs
    metadata and publishes the complete release. The reviewer should review
@@ -40,8 +40,8 @@ do not run it when you only intend to prepare public configuration.
    updater-containing version installed once before future in-app updates work.
 
 FUTURE RELEASES
-Update the source and increase VERSION.txt, for example to 0.5.1. Commit and
-push the matching v0.5.1 tag. The workflow builds packages and publishes only
+Update the source and increase VERSION.txt, for example to 0.6.1. Commit and
+push the matching v0.6.1 tag. The workflow builds packages and publishes only
 after all matrix builds succeed and the release environment permits signing.
 The build fails if the dependency audit fails; advisories are not ignored.
 
@@ -74,6 +74,13 @@ signing key and repository access must be protected. Compromise of the signing
 key or a trusted release workflow defeats this trust model.
 Ed25519 update signatures do not replace Windows Authenticode or Apple Developer
 ID signing/notarization. IT signing is still needed for smooth OS distribution.
-Native Windows/Mac update installation and the live GitHub workflow need testing
-on those systems before office rollout. No GitHub repository was created or
-release published by producing this download.
+Native Windows/Mac update installation needs testing before office rollout.
+The public repository is https://github.com/ljmcglinch/rhino-converter .
+Its release environment requires approval by ljmcglinch, disallows admin bypass,
+and accepts only version tags matching v*.*.*. Self-review is allowed because
+the repository currently has one publisher; this is not an independent review.
+The private key is kept outside the project in a Windows account-restricted
+folder. Do not paste it into chat, source files, issues or workflow logs.
+Existing 0.5.x installers have blank updater configuration: install a configured
+0.6.0 package once to enable future verified in-app updates. See GitHub Actions
+and Releases for current build and publication status.

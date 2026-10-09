@@ -23,7 +23,9 @@ from mac_update import validate_archive, apply_update
 class Updates(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        # Match mac_app_path's resolved-path contract (Mac /var aliases and
+        # Windows runner short TEMP names can resolve to different spellings).
+        self.root = Path(self.tmp.name).resolve()
         self.key = Ed25519PrivateKey.generate()
         public = self.key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.config = {'repository': 'office/rhino-converter', 'public_key': base64.b64encode(public).decode()}

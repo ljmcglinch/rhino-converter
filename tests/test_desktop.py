@@ -80,7 +80,10 @@ class Desktop(unittest.TestCase):
         for width, height in [(1200,860),(960,820),(640,480),(480,420),(460,360)]:
             self.app.geometry('%sx%s' % (width,height))
             self.settle()
-            self.assertEqual(self.app.body_columns, 2 if width >= 1200 else 1)
+            # Window managers may clamp the requested size to the CI display.
+            # Check the layout and controls against the actual client area.
+            width, height = self.app.winfo_width(), self.app.winfo_height()
+            self.assertEqual(self.app.body_columns, 2 if self.app.canvas.winfo_width() >= 1040 else 1)
             for column in (self.app.left_column, self.app.right_column):
                 self.assertLessEqual(column.winfo_x()+column.winfo_width(), self.app.body.winfo_width())
             for button in [self.app.convert_button,self.app.cancel_button,self.app.open_button]:
