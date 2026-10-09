@@ -1,6 +1,6 @@
 cadquery-ocp-novtk==7.8.1.1.post1
 rhino3dm==8.35.0
-numpy==2.3.5
+numpy==2.5.3
 cryptography==50.0.2
 cffi==2.1.1
 pycparser==3.1
