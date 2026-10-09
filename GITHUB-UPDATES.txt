@@ -40,6 +40,11 @@ do not run it when you only intend to prepare public configuration.
    updater-containing version installed once before future in-app updates work.
 
 FUTURE RELEASES
+For a new version, Actions > Start release > Run workflow on main validates
+VERSION.txt and creates its tag, then starts the installer workflow on that tag.
+This convenience workflow never reads the private signing secret. It refuses
+existing tags. To retry a failed existing tag, rerun its failed build jobs or
+run Build signed office release directly on that version tag.
 Update the source and increase VERSION.txt, for example to 0.6.1. Commit and
 push the matching v0.6.1 tag. The workflow builds packages and publishes only
 after all matrix builds succeed and the release environment permits signing.

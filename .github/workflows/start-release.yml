@@ -1,0 +1,30 @@
+name: Start release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: start-release
+  cancel-in-progress: false
+jobs:
+  tag:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Validate version and create its release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v$(tr -d '\r\n' < VERSION.txt)"
+          python release_tools.py validate --repository "$GITHUB_REPOSITORY" --tag "$TAG"
+          # Never overwrite a tag or silently select a different commit.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" > /dev/null
+          # Tags created with GITHUB_TOKEN do not trigger push workflows.
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
