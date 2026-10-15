@@ -6,6 +6,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import Converter
@@ -152,6 +153,69 @@ class Desktop(unittest.TestCase):
         self.app.clear_files()
         self.app.update()
         self.assertTrue(self.app.empty_hint.winfo_ismapped())
+
+    def test_save_defaults_and_folder_picker_for_all_modes(self):
+        self.assertTrue(self.app.new_folder.get())
+        self.assertTrue(self.app.source_folder.get())
+        self.assertEqual(str(self.app.dest_entry.cget('state')), 'disabled')
+        self.app.files = [str(Path(self.tmp.name)/'sample.3dm')]
+        chosen = str(Path(self.tmp.name)/'chosen')
+        for source_folder in (True, False):
+            for new_folder in (True, False):
+                with self.subTest(source_folder=source_folder, new_folder=new_folder):
+                    self.app.source_folder.set(source_folder)
+                    self.app.new_folder.set(new_folder)
+                    self.app.destination.set('')
+                    self.app.update_save_options()
+                    with patch('app.filedialog.askdirectory', return_value=chosen) as choose, \
+                         patch.object(self.app, 'next_job') as launch:
+                        self.app.start()
+                    self.assertEqual(choose.call_count, 0 if source_folder else 1)
+                    launch.assert_called_once()
+                    self.assertEqual(self.app.settings['options']['source_folder'], source_folder)
+                    self.assertEqual(self.app.settings['options']['new_folder'], new_folder)
+                    self.app.set_busy(False)
+                    expected = 'disabled' if source_folder else 'normal'
+                    self.assertEqual(str(self.app.dest_entry.cget('state')), expected)
+
+    def test_cancel_destination_picker_does_not_start_conversion(self):
+        self.app.files = [str(Path(self.tmp.name)/'sample.3dm')]
+        for new_folder in (True, False):
+            with self.subTest(new_folder=new_folder):
+                self.app.source_folder.set(False)
+                self.app.new_folder.set(new_folder)
+                with patch('app.filedialog.askdirectory', return_value='') as choose, \
+                     patch.object(self.app, 'next_job') as launch:
+                    self.app.start()
+                choose.assert_called_once()
+                launch.assert_not_called()
+                self.assertFalse(self.app.conversion_busy)
+                self.assertEqual(self.app.results, [])
+
+    def test_unchecking_source_prompts_and_batch_uses_each_source_folder(self):
+        with patch('app.filedialog.askdirectory', return_value=self.tmp.name) as choose:
+            self.app.source_folder_check.invoke()
+        choose.assert_called_once()
+        self.assertEqual(self.app.destination.get(), self.tmp.name)
+        self.app.source_folder_check.invoke()
+        import rhino3dm as r3
+        sources = []
+        for name in ('first', 'second'):
+            parent = Path(self.tmp.name)/name
+            parent.mkdir()
+            source = parent/'sample.3dm'
+            model = r3.File3dm()
+            model.Settings.ModelUnitSystem = r3.UnitSystem.Millimeters
+            model.Objects.AddBrep(r3.BoundingBox(r3.Point3d(0,0,0), r3.Point3d(1,2,3)).ToBrep())
+            self.assertTrue(model.Write(str(source), 6))
+            sources.append(source)
+        self.app.files = list(map(str, sources))
+        self.app.start()
+        self.pump_until(lambda:len(self.app.results) == 2 and self.app.process is None)
+        for source, result in zip(sources, self.app.results):
+            self.assertEqual(result['status'], 'complete')
+            self.assertEqual(Path(result['folder']), source.parent/'sample')
+            self.assertEqual(Path(result['report_path']).parent, source.parent/'sample')
 
 
 if __name__=='__main__': unittest.main()

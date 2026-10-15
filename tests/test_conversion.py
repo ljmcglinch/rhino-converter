@@ -235,5 +235,57 @@ class Conversions(unittest.TestCase):
             with self.assertRaises(ConversionError):
                 convert(source,self.root/'out',['brep'],{'output_name':name})
 
+    def test_all_save_locations_export_six_formats_and_preserve_source(self):
+        source = self.model([self.box()])
+        original = source.read_bytes()
+        formats = ['step', 'iges', 'brep', 'stl', 'obj', 'ply']
+        for source_folder in (True, False):
+            for new_folder in (True, False):
+                with self.subTest(source_folder=source_folder, new_folder=new_folder):
+                    destination = self.root/('chosen-' + str(new_folder))
+                    parent = source.parent if source_folder else destination
+                    result = convert(source, destination, formats,
+                                     {'source_folder': source_folder, 'new_folder': new_folder})
+                    folder = Path(result['folder'])
+                    self.assertEqual(result['status'], 'complete')
+                    self.assertEqual(len(result['outputs']), 6)
+                    self.assertEqual(folder.parent if new_folder else folder, parent)
+                    if source_folder:
+                        self.assertFalse(destination.exists())
+                    for item in result['outputs']:
+                        path = Path(item['path'])
+                        self.assertEqual(path.parent, folder)
+                        self.assertGreater(path.stat().st_size, 0)
+                    report = Path(result['report_path'])
+                    self.assertEqual(report.parent, folder)
+                    self.assertEqual(json.loads(report.read_text())['report_path'], str(report))
+                    self.assertEqual(source.read_bytes(), original)
+                    self.assertFalse(list(folder.glob('.rhino-converter-export-*')))
+
+    def test_direct_exports_preserve_existing_files_and_reports(self):
+        source = self.model([self.box()])
+        options = {'source_folder': True, 'new_folder': False}
+        # Fixed scratch/report names previously only lived in an owned folder.
+        unrelated = [self.root/'partial.brep', self.root/'conversion-report.json',
+                     self.root/'sample_BREP.brep', self.root/'sample_conversion-report.json']
+        for path in unrelated:
+            path.write_bytes(b'keep this existing file')
+        first = convert(source, None, ['brep'], options)
+        existing = {path: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
+        second = convert(source, None, ['brep'], options)
+        self.assertNotEqual(first['report_path'], second['report_path'])
+        self.assertNotEqual(first['outputs'][0]['path'], second['outputs'][0]['path'])
+        self.assertEqual(Path(first['outputs'][0]['path']).name, 'sample_BREP (2).brep')
+        self.assertEqual(Path(second['outputs'][0]['path']).name, 'sample_BREP (3).brep')
+        for path, content in existing.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertFalse(any(path.is_dir() for path in self.root.iterdir()))
+
+    def test_custom_destination_required_when_source_folder_is_off(self):
+        source = self.model([self.box()])
+        for destination in (None, '', '   '):
+            with self.subTest(destination=destination), self.assertRaisesRegex(ConversionError, 'destination folder'):
+                convert(source, destination, ['brep'], {'source_folder': False, 'new_folder': False})
+
 
 if __name__=='__main__': unittest.main()

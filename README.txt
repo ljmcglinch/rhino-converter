@@ -56,13 +56,22 @@ The main window uses separate cards for files, formats and output settings.
 Wide windows use two columns; smaller windows stack the cards. Selected
 format cards are highlighted, and a result summary accompanies conversion details.
 On Windows, drag one or more .3dm files from Explorer into the app. On either
-platform, use Add files. Select formats, destination, optionally an output name,
-then Convert. For one source, the chosen name is used for its folder and files.
+platform, use Add files. Select formats and save options, optionally an output
+name, then Convert. Both Create new folder and Use source folder start checked:
+- Both checked: create a folder beside each source file.
+- Only Use source folder: save directly beside each source, without a new folder.
+- Only Create new folder: choose where to create a folder for each source.
+- Neither checked: choose a destination and save directly into it.
+Uncheck Use source folder to choose a destination. Canceling the folder picker
+does not start conversion. For a batch, each source uses its own source folder.
+For one source, the chosen name is used for its new folder (if enabled) and files.
 Export filenames include the type: Office fixture_STEP.step,
 Office fixture_STL.stl, etc. Leave the output name blank to use the source name.
 For a batch, source filenames are appended to the chosen name.
-Each source gets its own named folder; existing folders get a (2), (3), etc.
-suffix. Previous exports are never overwritten.
+New folders get a (2), (3), etc. suffix when that name already exists.
+Direct exports and reports get a numbered filename when needed; previous
+exports and unrelated files are never overwritten. Direct exports have reports
+like Office fixture_conversion-report.json; new folders use conversion-report.json.
 Each conversion works from a temporary copy; the source file is untouched.
 A JSON report accompanies completed exports.
 Dimensions, text, annotation objects, hatches and viewport references are
@@ -74,8 +83,9 @@ batch, or Stop. A partial export report lists every skipped object.
 The layout wraps into fewer columns when resized and scrolls when needed.
 Conversion buttons and progress remain visible at the bottom.
 Stop cancels the active worker and remaining batch files. Completed exports
-stay on disk. An incomplete output may remain as partial.* after an abrupt
-worker crash or cancellation; do not use that file.
+stay on disk. An abrupt worker crash or cancellation can leave a temporary
+.rhino-converter-export-* folder containing partial exports, or an empty
+reserved filename. Do not use incomplete files.
 
 FORMAT SUPPORT IN THIS VERSION
 STEP (.step): BRep/NURBS CAD geometry, including valid reconstructed solids.

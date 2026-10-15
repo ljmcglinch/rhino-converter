@@ -177,10 +177,24 @@ class Converter(tk.Tk):
         hint.pack(fill='x')
         self.wrap_labels.append(hint)
         save_card = self.section(self.right_column, '03   Save options')
+        self.new_folder = tk.BooleanVar(value=True)
+        self.source_folder = tk.BooleanVar(value=True)
+        self.new_folder_check = ttk.Checkbutton(save_card, text='Create new folder', variable=self.new_folder,
+                                                command=self.update_save_options)
+        self.new_folder_check.pack(anchor='w')
+        self.source_folder_check = ttk.Checkbutton(save_card, text='Use source folder', variable=self.source_folder,
+                                                   command=lambda: self.update_save_options(prompt=True))
+        self.source_folder_check.pack(anchor='w')
+        self.checks += [self.new_folder_check, self.source_folder_check]
+        self.save_location_hint = tk.StringVar()
+        save_hint = tk.Label(save_card, textvariable=self.save_location_hint, bg=CARD, fg=MUTED,
+                             font=(FONT, 9), justify='left', anchor='w')
+        save_hint.pack(fill='x', pady=(4, 8))
+        self.wrap_labels.append(save_hint)
         tk.Label(save_card, text='Destination folder', bg=CARD, fg=INK, font=(FONT, 10, 'bold')).pack(anchor='w', pady=(0, 5))
         row = tk.Frame(save_card, bg=CARD)
         row.pack(fill='x')
-        self.destination = tk.StringVar(value=str(Path.home()/'Documents'/'Converted CAD'))
+        self.destination = tk.StringVar()
         self.dest_entry = ttk.Entry(row, textvariable=self.destination)
         self.dest_entry.pack(side='left', fill='x', expand=True, ipady=5)
         self.browse = ttk.Button(row, text='Browse', command=self.choose_folder)
@@ -191,7 +205,7 @@ class Converter(tk.Tk):
         self.chosen_name = tk.StringVar()
         self.name_entry = ttk.Entry(name_row, textvariable=self.chosen_name)
         self.name_entry.pack(side='left', fill='x', expand=True, ipady=5)
-        name_hint = tk.Label(save_card, text='Optional. Separate folders, with names like Fixture_STEP.step.', bg=CARD, fg=MUTED, font=(FONT, 9), justify='left', anchor='w')
+        name_hint = tk.Label(save_card, text='Optional. Names like Fixture_STEP.step; new folders use the same name.', bg=CARD, fg=MUTED, font=(FONT, 9), justify='left', anchor='w')
         name_hint.pack(fill='x', pady=(4, 0))
         self.wrap_labels.append(name_hint)
         options = self.options_grid = tk.Frame(save_card, bg=CARD)
@@ -224,6 +238,7 @@ class Converter(tk.Tk):
         self.log = tk.Text(activity_card, height=5, wrap='word', relief='flat', bg='#f4f8fa', fg=INK, font=(FONT, 9), padx=12, pady=10, state='disabled')
         self.log.pack(fill='both', expand=True)
         self.write_log('Prototype: six export formats. Complex models should be checked before production use.\nNative DWG, Parasolid, SAT and SolidWorks output are not supported in this free version.')
+        self.update_save_options()
         self.update_format_cards()
         self.layout()
         self.startup_callback = self.after_idle(self.finish_startup)
@@ -537,14 +552,33 @@ class Converter(tk.Tk):
         self.file_label.configure(text='0 files')
 
     def choose_folder(self):
-        folder = filedialog.askdirectory(title='Choose export destination')
+        folder = filedialog.askdirectory(parent=self,
+            title='Choose where to create new folders' if self.new_folder.get() else 'Choose export destination',
+            mustexist=True)
         if folder:
             self.destination.set(folder)
+        return bool(folder)
+
+    def update_save_options(self, prompt=False):
+        source = self.source_folder.get()
+        new = self.new_folder.get()
+        if source:
+            hint = ('Create a folder for each file beside its source.' if new else
+                    'Save files directly beside each source, without a new folder.')
+        else:
+            hint = ('Choose where to create a new folder for each file.' if new else
+                    'Choose a destination and save files directly into it.')
+        self.save_location_hint.set(hint)
+        for widget in (self.dest_entry, self.browse):
+            widget.configure(state='disabled' if source or self.conversion_busy else 'normal')
+        if prompt and not source and not self.destination.get().strip():
+            self.choose_folder()
 
     def set_busy(self, busy):
         self.conversion_busy = busy
         for widget in [self.add_button, self.clear_button, self.browse, self.dest_entry, self.name_entry, self.convert_button, *self.checks]:
             widget.configure(state='disabled' if busy else 'normal')
+        self.update_save_options()
         self.detail.configure(state='disabled' if busy else 'readonly')
         self.cancel_button.configure(state='normal' if busy else 'disabled')
 
@@ -559,8 +593,8 @@ class Converter(tk.Tk):
             self.next_job(source=source, allow_partial=True)
             return
         formats = [f for f, v in self.format_vars.items() if v.get()]
-        if not self.files or not formats or not self.destination.get().strip():
-            messagebox.showinfo('Choose files and formats', 'Add a .3dm file, select at least one output format, and choose a destination.')
+        if not self.files or not formats:
+            messagebox.showinfo('Choose files and formats', 'Add a .3dm file and select at least one output format.')
             return
         self.batch_name = self.chosen_name.get().strip()
         if self.batch_name:
@@ -570,7 +604,13 @@ class Converter(tk.Tk):
             except ConversionError as exc:
                 messagebox.showinfo('Choose another output name', str(exc))
                 return
-        self.settings = {'destination': self.destination.get(), 'formats': formats, 'options': {'include_hidden': self.hidden.get(), 'exclude_curves': self.curves.get(), 'deviation': [0.03, 0.1, 0.5][self.detail.current()]}}
+        if not self.source_folder.get() and not self.destination.get().strip():
+            if not self.choose_folder():
+                return
+        self.settings = {'destination': self.destination.get().strip(), 'formats': formats,
+                         'options': {'source_folder': self.source_folder.get(), 'new_folder': self.new_folder.get(),
+                                     'include_hidden': self.hidden.get(), 'exclude_curves': self.curves.get(),
+                                     'deviation': [0.03, 0.1, 0.5][self.detail.current()]}}
         self.pending = list(self.files)
         self.results = []
         self.total = len(self.pending)
@@ -646,7 +686,7 @@ class Converter(tk.Tk):
         if result.get('folder'):
             self.last_folder = result['folder']
             self.open_button.configure(state='normal')
-            self.write_log('Report: ' + str(Path(result['folder'])/'conversion-report.json'))
+            self.write_log('Report: ' + result.get('report_path', str(Path(result['folder'])/'conversion-report.json')))
         self.cleanup()
         self.next_job()
 
