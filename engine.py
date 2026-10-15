@@ -53,6 +53,30 @@ def result_folder(destination, name):
     raise ConversionError('Too many result folders already use that name.')
 
 
+def reserve_output(directory, name):
+    """Claim an unused filename, including on repeated runs in a shared folder."""
+    filename = Path(name)
+    for number in range(1, 10001):
+        candidate = directory/(name if number == 1 else '%s (%s)%s' % (filename.stem, number, filename.suffix))
+        try:
+            with candidate.open('xb'):
+                pass
+            return candidate
+        except FileExistsError:
+            continue
+    raise ConversionError('Too many output files already use that name.')
+
+
+def publish_output(temporary, directory, name):
+    final = reserve_output(directory, name)
+    try:
+        temporary.replace(final)
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
+    return final
+
+
 def load_geometry(source, options, progress):
     import numpy as np
     import rhino3dm as r3
@@ -251,12 +275,20 @@ def convert(source, destination, formats, options=None, progress=lambda value, t
     from OCP.IFSelect import IFSelect_ReturnStatus
     from OCP.BRepTools import BRepTools
     from OCP.Interface import Interface_Static
-    source, destination = Path(source), Path(destination)
+    source = Path(source).expanduser().absolute()
     options = options or {}
     if not source.is_file() or source.suffix.lower() != '.3dm':
         raise ConversionError('Choose an existing .3dm file.')
     if not formats or any(f not in FORMATS for f in formats):
         raise ConversionError('Choose at least one supported output format.')
+    # Desktop defaults are supplied in the job. Legacy callers keep their
+    # explicit destination and separate-folder behavior when flags are absent.
+    if options.get('source_folder', False):
+        destination = source.parent
+    else:
+        if destination is None or not str(destination).strip():
+            raise ConversionError('Choose a destination folder.')
+        destination = Path(destination).expanduser().absolute()
     basename = output_name(options.get('output_name') or source.stem)
     deviation = float(options.get('deviation', 0.1))
     if not math.isfinite(deviation) or not 0.001 <= deviation <= 10:
@@ -274,53 +306,63 @@ def convert(source, destination, formats, options=None, progress=lambda value, t
     report.update({'source': str(source), 'outputs': [], 'format_errors': {}, 'mesh_deviation_mm': deviation})
     exact = [s for _, s in named if not isinstance(s, MeshShape)]
     has_mesh = len(exact) != len(named)
-    # A unique run folder never overwrites previous exports or the source.
-    run = result_folder(destination, basename)
+    run = result_folder(destination, basename) if options.get('new_folder', True) else destination
     report['output_name'] = basename
     mesh_data = None
-    for i, fmt in enumerate(dict.fromkeys(formats)):
-        progress(0.72 + 0.25 * i/len(formats), 'Writing ' + FORMATS[fmt][0])
-        final = run/(basename + '_' + fmt.upper() + '.' + fmt)
-        temp = run/('partial.' + fmt)
-        try:
-            if fmt in ('step', 'iges', 'brep'):
-                if has_mesh:
-                    raise ConversionError('The model contains meshes. Exact CAD export would omit them; choose a mesh format.')
-                if fmt == 'step':
-                    writer = STEPControl_Writer()
-                    Interface_Static.SetCVal_s('write.step.unit', 'MM')
-                    for shape in exact:
-                        if writer.Transfer(shape, STEPControl_StepModelType.STEPControl_AsIs) != IFSelect_ReturnStatus.IFSelect_RetDone:
-                            raise ConversionError('STEP geometry transfer failed.')
-                    if writer.Write(str(temp)) != IFSelect_ReturnStatus.IFSelect_RetDone:
-                        raise ConversionError('STEP write failed.')
-                elif fmt == 'iges':
-                    writer = IGESControl_Writer('MM', 0)
-                    for shape in exact:
-                        if not writer.AddShape(shape):
-                            raise ConversionError('IGES geometry transfer failed.')
-                    writer.ComputeModel()
-                    if not writer.Write(str(temp)):
-                        raise ConversionError('IGES write failed.')
+    # Exporter scratch paths must never collide with files in a user's source
+    # folder. A private directory also keeps partial exports out of final names.
+    with tempfile.TemporaryDirectory(prefix='.rhino-converter-export-', dir=run) as workspace:
+        for i, fmt in enumerate(dict.fromkeys(formats)):
+            progress(0.72 + 0.25 * i/len(formats), 'Writing ' + FORMATS[fmt][0])
+            temp = Path(workspace)/('partial.' + fmt)
+            try:
+                if fmt in ('step', 'iges', 'brep'):
+                    if has_mesh:
+                        raise ConversionError('The model contains meshes. Exact CAD export would omit them; choose a mesh format.')
+                    if fmt == 'step':
+                        writer = STEPControl_Writer()
+                        Interface_Static.SetCVal_s('write.step.unit', 'MM')
+                        for shape in exact:
+                            if writer.Transfer(shape, STEPControl_StepModelType.STEPControl_AsIs) != IFSelect_ReturnStatus.IFSelect_RetDone:
+                                raise ConversionError('STEP geometry transfer failed.')
+                        if writer.Write(str(temp)) != IFSelect_ReturnStatus.IFSelect_RetDone:
+                            raise ConversionError('STEP write failed.')
+                    elif fmt == 'iges':
+                        writer = IGESControl_Writer('MM', 0)
+                        for shape in exact:
+                            if not writer.AddShape(shape):
+                                raise ConversionError('IGES geometry transfer failed.')
+                        writer.ComputeModel()
+                        if not writer.Write(str(temp)):
+                            raise ConversionError('IGES write failed.')
+                    else:
+                        if not BRepTools.Write_s(geometry.make_compound(exact), str(temp)):
+                            raise ConversionError('BREP write failed.')
                 else:
-                    if not BRepTools.Write_s(geometry.make_compound(exact), str(temp)):
-                        raise ConversionError('BREP write failed.')
-            else:
-                if mesh_data is None:
-                    mesh_data = triangles(named, deviation)
-                    if mesh_data[3]:
-                        report['warnings'].append('Mesh exports omit curves/points: ' + ', '.join(mesh_data[3]))
-                write_mesh(temp, fmt, mesh_data)
-            if not temp.exists() or temp.stat().st_size == 0:
-                raise ConversionError('The exporter did not create a nonempty output file.')
-            temp.replace(final)
-            report['outputs'].append({'format': fmt, 'path': str(final), 'bytes': final.stat().st_size})
-        except Exception as exc:
-            temp.unlink(missing_ok=True)
-            report['format_errors'][fmt] = str(exc)
-    report['status'] = ('partial' if report['skipped_objects'] else 'complete') if not report['format_errors'] else ('partial' if report['outputs'] else 'failed')
-    report['folder'] = str(run)
-    (run/'conversion-report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+                    if mesh_data is None:
+                        mesh_data = triangles(named, deviation)
+                        if mesh_data[3]:
+                            report['warnings'].append('Mesh exports omit curves/points: ' + ', '.join(mesh_data[3]))
+                    write_mesh(temp, fmt, mesh_data)
+                if not temp.exists() or temp.stat().st_size == 0:
+                    raise ConversionError('The exporter did not create a nonempty output file.')
+                final = publish_output(temp, run, basename + '_' + fmt.upper() + '.' + fmt)
+                report['outputs'].append({'format': fmt, 'path': str(final), 'bytes': final.stat().st_size})
+            except Exception as exc:
+                temp.unlink(missing_ok=True)
+                report['format_errors'][fmt] = str(exc)
+        report['status'] = ('partial' if report['skipped_objects'] else 'complete') if not report['format_errors'] else ('partial' if report['outputs'] else 'failed')
+        report['folder'] = str(run)
+        report_name = 'conversion-report.json' if options.get('new_folder', True) else basename + '_conversion-report.json'
+        report_path = reserve_output(run, report_name)
+        report['report_path'] = str(report_path)
+        try:
+            temporary_report = Path(workspace)/'report.json'
+            temporary_report.write_text(json.dumps(report, indent=2), encoding='utf-8')
+            temporary_report.replace(report_path)
+        except BaseException:
+            report_path.unlink(missing_ok=True)
+            raise
     progress(1, 'Complete' if report['outputs'] else 'No formats could be exported')
     return report
 

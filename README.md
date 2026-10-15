@@ -4,14 +4,27 @@ Convert Rhino `.3dm` files locally without installing Rhino or Python. Supports 
 
 ## Download and install
 
-Download installers from [GitHub Releases](https://github.com/ljmcglinch/rhino-converter/releases/latest). A release will appear after the first complete, verified build.
+Download installers from [GitHub Releases](https://github.com/ljmcglinch/rhino-converter/releases/latest).
 
 - **Windows 10/11, 64-bit:** run `RhinoConverter-Setup.exe`.
 - **Mac, macOS 14 or newer:** choose the disk image for Apple Silicon (`arm64`) or Intel (`x86_64`), open it and drag the app into Applications.
 
 Windows installers currently have no Authenticode signature. Mac packages currently use development signatures and have not been notarized. Native Mac installation and replacement still require testing.
 
-Original files stay unchanged. Outputs go into separate folders. Annotations and curves are skipped by default. Review converted production geometry before relying on it.
+Original files stay unchanged. Annotations and curves are skipped by default. Review converted production geometry before relying on it.
+
+## Where converted files go
+
+Both **Create new folder** and **Use source folder** are checked by default.
+
+| Create new folder | Use source folder | Result |
+| --- | --- | --- |
+| Checked | Checked | A new folder beside each source file. |
+| Unchecked | Checked | Files directly beside each source file. |
+| Checked | Unchecked | Choose a destination; create a new folder there for each source. |
+| Unchecked | Unchecked | Choose a destination; save files directly into it. |
+
+New folders use the source filename, or the optional output name. For batches, each file uses its own source folder when that option is checked. Existing folders, exports and reports are preserved by adding a numbered suffix when needed. Direct exports get a report named after the output, such as `Fixture_conversion-report.json`.
 
 ## Updates and privacy
 
