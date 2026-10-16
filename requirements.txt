@@ -3,4 +3,4 @@ rhino3dm==8.35.0
 numpy==2.3.5
 cryptography==50.0.2
 cffi==2.1.1
-pycparser==3.1
+pycparser==3.11
